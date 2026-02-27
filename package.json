@@ -1,9 +1,14 @@
 {
   "name": "@jwilger/pi-orchestrator",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Deterministic multi-agent SDLC orchestration for pi",
   "type": "module",
-  "keywords": ["pi-package", "pi", "orchestra", "orchestrator"],
+  "keywords": [
+    "pi-package",
+    "pi",
+    "orchestra",
+    "orchestrator"
+  ],
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -17,7 +22,9 @@
     "access": "public"
   },
   "pi": {
-    "extensions": ["./src/extension/index.ts"]
+    "extensions": [
+      "./src/extension/index.ts"
+    ]
   },
   "scripts": {
     "test": "vitest run",
