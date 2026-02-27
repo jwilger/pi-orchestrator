@@ -182,8 +182,8 @@ export default function (pi: ExtensionAPI): void {
           return;
         }
 
-        autopilotTokens.set(workflowId, token);
         const result = await engine.dispatchCurrentState(workflowId);
+        autopilotTokens.set(workflowId, token);
         if (!result.dispatched && result.details.includes("terminal")) {
           stopAutopilot(workflowId);
         }
