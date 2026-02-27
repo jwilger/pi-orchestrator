@@ -16,9 +16,10 @@ export const buildCutlineStatus = (): CutlineStatus => ({
     "CI/release/publish pipeline with 100% mutation gate",
   ],
   deferred: [
-    "Richer interactive TUI components beyond line widgets",
-    "Automated tuner A/B experiments with rollback policy",
-    "Background health scheduler and autonomous escalation loops",
-    "Advanced zellij pane recovery/respawn orchestration",
+    "S1: Command entrypoint + panel launcher seam with tests",
+    "S2: Read-only interactive panel rendering + keyboard navigation",
+    "S3: Workflow actions (dispatch/pause/resume) with TDD coverage",
+    "S4: Pane controls (focus/close/jump) with TDD coverage",
+    "S5: Hardening/docs/help updates and evidence trail",
   ],
 });
