@@ -11,24 +11,37 @@ export interface PaneSpawnSpec {
   command: string[];
 }
 
+export const parseTabInfos = (output: string): PaneInfo[] => {
+  const lines = output
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+
+  return lines.map((line, index) => ({
+    id: `tab-${index + 1}`,
+    name: line,
+  }));
+};
+
 const parseAttribute = (input: string, key: string): string | undefined => {
-  const match = input.match(new RegExp(`${key}="([^"]+)"`));
-  return match?.[1];
+  const equalsStyle = input.match(new RegExp(`${key}="([^"]+)"`));
+  if (equalsStyle?.[1]) {
+    return equalsStyle[1];
+  }
+
+  const kdlStyle = input.match(new RegExp(`${key}\\s+"([^"]+)"`));
+  return kdlStyle?.[1];
 };
 
 export const parsePaneInfos = (layout: string): PaneInfo[] => {
   const panes: PaneInfo[] = [];
-  for (const line of layout.split("\n")) {
+  for (const [index, line] of layout.split("\n").entries()) {
     const trimmed = line.trim();
-    if (!trimmed.startsWith("pane ")) {
+    if (!/^pane\b/.test(trimmed)) {
       continue;
     }
 
-    const id = parseAttribute(trimmed, "id");
-    if (!id) {
-      continue;
-    }
-
+    const id = parseAttribute(trimmed, "id") ?? `pane-${index + 1}`;
     const name = parseAttribute(trimmed, "name");
     panes.push({
       id,
@@ -104,6 +117,15 @@ export class ZellijSupervisor {
   }
 
   async listPanes(): Promise<PaneInfo[]> {
+    const tabsResult = await this.runZellij(["action", "query-tab-names"]);
+    if (tabsResult.code === 0) {
+      const tabs = parseTabInfos(tabsResult.stdout);
+      if (tabs.length > 0) {
+        this.indexTrackedPanes(tabs);
+        return tabs;
+      }
+    }
+
     const result = await this.runZellij(["action", "dump-layout"]);
     if (result.code !== 0) {
       return [];
@@ -181,8 +203,14 @@ export class ZellijSupervisor {
   }
 
   async focusPane(paneId: string): Promise<boolean> {
-    const result = await this.runZellij(["action", "focus-pane", paneId]);
-    return result.code === 0;
+    const paneResult = await this.runZellij(["action", "focus-pane", paneId]);
+    if (paneResult.code === 0) {
+      return true;
+    }
+
+    const tabIndex = paneId.startsWith("tab-") ? paneId.slice(4) : paneId;
+    const tabResult = await this.runZellij(["action", "go-to-tab", tabIndex]);
+    return tabResult.code === 0;
   }
 
   async closePane(paneId: string): Promise<boolean> {
@@ -191,11 +219,21 @@ export class ZellijSupervisor {
       return false;
     }
 
-    const result = await this.runZellij(["action", "close-pane"]);
-    return result.code === 0;
+    const closePaneResult = await this.runZellij(["action", "close-pane"]);
+    if (closePaneResult.code === 0) {
+      return true;
+    }
+
+    const closeTabResult = await this.runZellij(["action", "close-tab"]);
+    return closeTabResult.code === 0;
   }
 
   async focusPaneByName(name: string): Promise<boolean> {
+    const tabResult = await this.runZellij(["action", "go-to-tab-name", name]);
+    if (tabResult.code === 0) {
+      return true;
+    }
+
     const panes = await this.listPanes();
     const pane = panes.find((entry) => entry.name === name);
     if (!pane) {

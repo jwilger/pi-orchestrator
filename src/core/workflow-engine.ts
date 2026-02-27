@@ -383,7 +383,7 @@ export class WorkflowEngine {
     );
 
     const agentId = asAgentId(`${workflowId}-${current.assign}`);
-    await this.spawnAgent({
+    const spawn = await this.spawnAgent({
       agentId: agentId as unknown as string,
       workflowId,
       role: current.assign,
@@ -393,6 +393,24 @@ export class WorkflowEngine {
       runtimeState: state,
       stateDefinition: current,
     });
+
+    if (spawn.code !== 0) {
+      state.metrics.agent_spawn_failure = {
+        state: state.current_state,
+        role: current.assign,
+        code: spawn.code,
+        stderr: spawn.stderr,
+        stdout: spawn.stdout,
+        command: spawn.command,
+        at: new Date().toISOString(),
+      };
+      state.updated_at = new Date().toISOString();
+      this.store.saveWorkflowState(state);
+      const stderrText = spawn.stderr.length > 0 ? spawn.stderr : "(none)";
+      throw new Error(
+        `Failed to spawn agent ${agentId as unknown as string}: exit=${spawn.code} stderr=${stderrText}`,
+      );
+    }
 
     return {
       dispatched: true,
@@ -409,7 +427,12 @@ export class WorkflowEngine {
     workflowDefinition: WorkflowDefinition;
     runtimeState: WorkflowRuntimeState;
     stateDefinition: AgentState;
-  }): Promise<void> {
+  }): Promise<{
+    code: number;
+    stdout: string;
+    stderr: string;
+    command: string;
+  }> {
     const runtimeDir = path.join(
       this.cwd,
       ".orchestra",
@@ -460,9 +483,10 @@ export class WorkflowEngine {
     const sessionDir = path.join(runtimeDir, "session");
     fs.mkdirSync(sessionDir, { recursive: true });
 
-    await this.execCommand(
-      `zellij action new-tab --name ${shellEscape(input.agentId)} --cwd ${shellEscape(this.cwd)} -- pi --tools ${shellEscape(input.roleDefinition.tools.join(","))} -e ${shellEscape(scopePath)} --append-system-prompt ${shellEscape(promptPath)} --session-dir ${shellEscape(sessionDir)} @${shellEscape(taskPath)}`,
-    );
+    const agentCommand = `pi --tools ${shellEscape(input.roleDefinition.tools.join(","))} -e ${shellEscape(scopePath)} --append-system-prompt ${shellEscape(promptPath)} --session-dir ${shellEscape(sessionDir)} @${shellEscape(taskPath)}`;
+    const command = `zellij action new-tab --name ${shellEscape(input.agentId)} --cwd ${shellEscape(this.cwd)} && zellij action write-chars ${shellEscape(agentCommand)} && zellij action write 13`;
+    const result = await this.execCommand(command);
+    return { ...result, command };
   }
 
   private async dispatchSubworkflow(
