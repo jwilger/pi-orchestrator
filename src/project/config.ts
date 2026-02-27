@@ -141,11 +141,11 @@ const normalizeProjectConfig = (parsed: unknown): ProjectConfig => {
     ...defaultProjectConfig,
     ...parsed,
     team: Array.isArray(parsed.team)
-      ? (parsed.team
+      ? parsed.team
           .map(normalizeTeamMember)
-          .filter((m): m is TeamMember => m !== null))
+          .filter((m): m is TeamMember => m !== null)
       : defaultProjectConfig.team,
-    roles: normalizeRoles(parsed.roles) ?? defaultProjectConfig.roles,
+    roles: normalizeRoles(parsed.roles) ?? defaultProjectConfig.roles ?? {},
   };
 };
 

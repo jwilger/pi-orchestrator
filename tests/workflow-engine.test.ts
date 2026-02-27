@@ -1298,7 +1298,9 @@ describe("buildAgentPrompt", () => {
   });
 
   it("omits project context when projectConfig is not provided", () => {
-    const prompt = buildAgentPrompt(makePromptInput({ projectConfig: undefined }));
+    const prompt = buildAgentPrompt(
+      makePromptInput({ projectConfig: undefined }),
+    );
     expect(prompt).not.toContain("## Project Context");
   });
 
@@ -1422,7 +1424,13 @@ describe("buildAgentTask", () => {
           },
           metrics: {},
           history: [
-            { state: "RED", entered_at: "2026-01-01T00:00:00Z", retries: 0, exited_at: "2026-01-01T00:01:00Z", result: "pass" },
+            {
+              state: "RED",
+              entered_at: "2026-01-01T00:00:00Z",
+              retries: 0,
+              exited_at: "2026-01-01T00:01:00Z",
+              result: "pass",
+            },
             { state: "GREEN", entered_at: "2026-01-01T00:01:00Z", retries: 0 },
           ],
           created_at: "2026-01-01T00:00:00Z",
@@ -1515,7 +1523,9 @@ describe("buildAgentTask", () => {
           params: { scenario: "user login", test_runner: "bun test" },
           evidence: {},
           metrics: {},
-          history: [{ state: "RED", entered_at: "2026-01-01T00:00:00Z", retries: 0 }],
+          history: [
+            { state: "RED", entered_at: "2026-01-01T00:00:00Z", retries: 0 },
+          ],
           created_at: "2026-01-01T00:00:00Z",
           updated_at: "2026-01-01T00:00:00Z",
         },
@@ -1771,9 +1781,18 @@ describe("resolvePersonaForDispatch", () => {
       "ping",
       makeRuntime(
         [
-          "RED", "DOMAIN_REVIEW_TEST", "GREEN", "DOMAIN_REVIEW_IMPL",
-          "RED", "DOMAIN_REVIEW_TEST", "GREEN", "DOMAIN_REVIEW_IMPL",
-          "RED", "DOMAIN_REVIEW_TEST", "GREEN", "DOMAIN_REVIEW_IMPL",
+          "RED",
+          "DOMAIN_REVIEW_TEST",
+          "GREEN",
+          "DOMAIN_REVIEW_IMPL",
+          "RED",
+          "DOMAIN_REVIEW_TEST",
+          "GREEN",
+          "DOMAIN_REVIEW_IMPL",
+          "RED",
+          "DOMAIN_REVIEW_TEST",
+          "GREEN",
+          "DOMAIN_REVIEW_IMPL",
           "RED",
         ],
         "RED",
@@ -1795,7 +1814,7 @@ describe("resolvePersonaForDispatch", () => {
       workflowDef,
     );
     expect(result.persona).toBe(".team/a.md");
-    expect(role.persona).toBeUndefined();
+    expect((role as Record<string, unknown>).persona).toBeUndefined();
   });
 
   it("domain_reviewer with fixed persona is unaffected by pool logic", () => {
@@ -1975,8 +1994,16 @@ describe("subworkflow composition", () => {
 
   it("dispatches a subworkflow state by starting a child workflow", async () => {
     const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "orch-sub-"));
-    writeWorkflow(path.join(cwd, "src", "workflows"), "child-wf", childWorkflowTs);
-    writeWorkflow(path.join(cwd, "src", "workflows"), "parent-wf", parentWorkflowTs);
+    writeWorkflow(
+      path.join(cwd, "src", "workflows"),
+      "child-wf",
+      childWorkflowTs,
+    );
+    writeWorkflow(
+      path.join(cwd, "src", "workflows"),
+      "parent-wf",
+      parentWorkflowTs,
+    );
 
     const { pi } = createFakePi();
     const store = new StateStore(path.join(cwd, ".orchestra"));
@@ -1993,7 +2020,9 @@ describe("subworkflow composition", () => {
       evidence: { input: "hello" },
     });
 
-    const parentAfterSetup = engine.get(parent.workflow_id)!;
+    const parentAfterSetup = engine.get(
+      parent.workflow_id,
+    ) as WorkflowRuntimeState;
     expect(parentAfterSetup.current_state).toBe("DELEGATE");
 
     // Dispatch triggers child workflow creation
@@ -2003,17 +2032,21 @@ describe("subworkflow composition", () => {
     expect(dispatch.details).toContain("child-wf");
 
     // Verify parent has a child tracked
-    const parentWithChild = engine.get(parent.workflow_id)!;
+    const parentWithChild = engine.get(
+      parent.workflow_id,
+    ) as WorkflowRuntimeState;
     expect(parentWithChild.children).toBeDefined();
-    const childId = parentWithChild.children!.DELEGATE;
+    const childId = parentWithChild.children?.DELEGATE;
     expect(childId).toBeDefined();
 
     // Verify child has parent link
-    const child = engine.get(childId as unknown as string)!;
+    const child = engine.get(
+      childId as unknown as string,
+    ) as WorkflowRuntimeState;
     expect(child.parent).toBeDefined();
-    expect(child.parent!.workflow_id).toBe(parent.workflow_id);
-    expect(child.parent!.state).toBe("DELEGATE");
-    expect(child.workflow_type).toBe("child-wf" as any);
+    expect(child.parent?.workflow_id).toBe(parent.workflow_id);
+    expect(child.parent?.state).toBe("DELEGATE");
+    expect(child.workflow_type).toBe("child-wf" as unknown as string);
     expect(child.current_state).toBe("WORK");
 
     // Verify child received mapped params
@@ -2022,8 +2055,16 @@ describe("subworkflow composition", () => {
 
   it("propagates child completion back to parent", async () => {
     const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "orch-sub-"));
-    writeWorkflow(path.join(cwd, "src", "workflows"), "child-wf", childWorkflowTs);
-    writeWorkflow(path.join(cwd, "src", "workflows"), "parent-wf", parentWorkflowTs);
+    writeWorkflow(
+      path.join(cwd, "src", "workflows"),
+      "child-wf",
+      childWorkflowTs,
+    );
+    writeWorkflow(
+      path.join(cwd, "src", "workflows"),
+      "parent-wf",
+      parentWorkflowTs,
+    );
 
     const { pi } = createFakePi();
     const store = new StateStore(path.join(cwd, ".orchestra"));
@@ -2039,8 +2080,10 @@ describe("subworkflow composition", () => {
     });
 
     await engine.dispatchCurrentState(parent.workflow_id);
-    const parentWithChild = engine.get(parent.workflow_id)!;
-    const childId = parentWithChild.children!.DELEGATE as unknown as string;
+    const parentWithChild = engine.get(
+      parent.workflow_id,
+    ) as WorkflowRuntimeState;
+    const childId = parentWithChild.children?.DELEGATE as unknown as string;
 
     // Complete the child workflow
     await engine.submitEvidence(childId, {
@@ -2050,27 +2093,40 @@ describe("subworkflow composition", () => {
     });
 
     // Child should be at DONE terminal
-    const childDone = engine.get(childId)!;
+    const childDone = engine.get(childId) as WorkflowRuntimeState;
     expect(childDone.current_state).toBe("DONE");
 
     // Dispatch child's terminal state → triggers parent propagation
     await engine.dispatchCurrentState(childId);
 
     // Parent should have advanced past DELEGATE → DONE
-    const parentDone = engine.get(parent.workflow_id)!;
+    const parentDone = engine.get(parent.workflow_id) as WorkflowRuntimeState;
     expect(parentDone.current_state).toBe("DONE");
 
     // Parent evidence should contain child evidence under DELEGATE
-    const delegateEvidence = parentDone.evidence.DELEGATE as any;
+    const delegateEvidence = parentDone.evidence.DELEGATE as Record<
+      string,
+      unknown
+    >;
     expect(delegateEvidence.child_workflow_id).toBe(childId);
     expect(delegateEvidence.child_result).toBe("success");
-    expect(delegateEvidence.child_evidence.WORK).toBeDefined();
+    expect(
+      (delegateEvidence.child_evidence as Record<string, unknown>).WORK,
+    ).toBeDefined();
   });
 
   it("resolves $slot references from params.slots", async () => {
     const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "orch-sub-"));
-    writeWorkflow(path.join(cwd, "src", "workflows"), "child-wf", childWorkflowTs);
-    writeWorkflow(path.join(cwd, "src", "workflows"), "slot-parent-wf", slotParentWorkflowTs);
+    writeWorkflow(
+      path.join(cwd, "src", "workflows"),
+      "child-wf",
+      childWorkflowTs,
+    );
+    writeWorkflow(
+      path.join(cwd, "src", "workflows"),
+      "slot-parent-wf",
+      slotParentWorkflowTs,
+    );
 
     const { pi } = createFakePi();
     const store = new StateStore(path.join(cwd, ".orchestra"));
@@ -2086,15 +2142,19 @@ describe("subworkflow composition", () => {
     expect(dispatch.dispatched).toBe(true);
     expect(dispatch.details).toContain("child-wf");
 
-    const parentState = engine.get(parent.workflow_id)!;
-    const childId = parentState.children!.DELEGATE as unknown as string;
-    const child = engine.get(childId)!;
-    expect(child.workflow_type).toBe("child-wf" as any);
+    const parentState = engine.get(parent.workflow_id) as WorkflowRuntimeState;
+    const childId = parentState.children?.DELEGATE as unknown as string;
+    const child = engine.get(childId) as WorkflowRuntimeState;
+    expect(child.workflow_type).toBe("child-wf" as unknown as string);
   });
 
   it("throws when $slot reference cannot be resolved", async () => {
     const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "orch-sub-"));
-    writeWorkflow(path.join(cwd, "src", "workflows"), "slot-parent-wf", slotParentWorkflowTs);
+    writeWorkflow(
+      path.join(cwd, "src", "workflows"),
+      "slot-parent-wf",
+      slotParentWorkflowTs,
+    );
 
     const { pi } = createFakePi();
     const store = new StateStore(path.join(cwd, ".orchestra"));
@@ -2110,7 +2170,11 @@ describe("subworkflow composition", () => {
 
   it("throws when referenced subworkflow definition does not exist", async () => {
     const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "orch-sub-"));
-    writeWorkflow(path.join(cwd, "src", "workflows"), "slot-parent-wf", slotParentWorkflowTs);
+    writeWorkflow(
+      path.join(cwd, "src", "workflows"),
+      "slot-parent-wf",
+      slotParentWorkflowTs,
+    );
 
     const { pi } = createFakePi();
     const store = new StateStore(path.join(cwd, ".orchestra"));
@@ -2223,10 +2287,7 @@ describe("applyRoleOverrides", () => {
     };
     const result = applyRoleOverrides(baseRole, "ping", config);
     // alice has both "tdd" and "test", bob has "tdd" — both match
-    expect(result.personaPool).toEqual([
-      ".team/alice.md",
-      ".team/bob.md",
-    ]);
+    expect(result.personaPool).toEqual([".team/alice.md", ".team/bob.md"]);
     // personaTags clears fixed persona
     expect(result.persona).toBeUndefined();
   });
@@ -2234,9 +2295,7 @@ describe("applyRoleOverrides", () => {
   it("personaTags with no matching team members leaves pool unchanged", () => {
     const config: ProjectConfig = {
       ...baseConfig,
-      team: [
-        { role: "carol", persona: ".team/carol.md", tags: ["review"] },
-      ],
+      team: [{ role: "carol", persona: ".team/carol.md", tags: ["review"] }],
       roles: {
         ping: { personaTags: ["tdd"] },
       },
@@ -2379,9 +2438,7 @@ describe("project config role overrides with engine dispatch", () => {
       testDir: "tests/**",
       srcDir: "src/**",
       typeDir: "src/**",
-      team: [
-        { role: "alice", persona: ".team/alice.md", tags: ["dev"] },
-      ],
+      team: [{ role: "alice", persona: ".team/alice.md", tags: ["dev"] }],
       roles: {
         worker: { persona: ".team/alice.md" },
       },
@@ -2416,13 +2473,17 @@ describe("resolvePersonaFromParams", () => {
   };
 
   it("returns role unchanged when no personaFrom is set", () => {
-    const result = resolvePersonaFromParams(baseRole, { turn_persona: ".team/x.md" });
+    const result = resolvePersonaFromParams(baseRole, {
+      turn_persona: ".team/x.md",
+    });
     expect(result).toBe(baseRole);
   });
 
   it("resolves persona from params when personaFrom is set", () => {
     const role = { ...baseRole, personaFrom: "turn_persona" };
-    const result = resolvePersonaFromParams(role, { turn_persona: ".team/kent.md" });
+    const result = resolvePersonaFromParams(role, {
+      turn_persona: ".team/kent.md",
+    });
     expect(result.persona).toBe(".team/kent.md");
     expect(result.personaPool).toBeUndefined();
     expect(result).not.toBe(role); // shallow copy
@@ -2434,7 +2495,9 @@ describe("resolvePersonaFromParams", () => {
       personaFrom: "turn_persona",
       personaPool: [".team/a.md", ".team/b.md"],
     };
-    const result = resolvePersonaFromParams(role, { turn_persona: ".team/kent.md" });
+    const result = resolvePersonaFromParams(role, {
+      turn_persona: ".team/kent.md",
+    });
     expect(result.persona).toBe(".team/kent.md");
     expect(result.personaPool).toBeUndefined();
   });
@@ -2524,9 +2587,9 @@ describe("personaFrom end-to-end via subworkflow", () => {
     await engine.dispatchCurrentState(parent.workflow_id);
 
     // Find the child
-    const parentState = engine.get(parent.workflow_id)!;
-    const childId = parentState.children!.TURN as unknown as string;
-    const child = engine.get(childId)!;
+    const parentState = engine.get(parent.workflow_id) as WorkflowRuntimeState;
+    const childId = parentState.children?.TURN as unknown as string;
+    const child = engine.get(childId) as WorkflowRuntimeState;
 
     // Child should have received the persona in its params
     expect(child.params.turn_persona).toBe(".team/kent.md");

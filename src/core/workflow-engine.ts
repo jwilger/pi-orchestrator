@@ -321,6 +321,11 @@ export class WorkflowEngine {
       throw new Error(`Unknown state ${state.current_state}`);
     }
 
+    // AgentState is the only variant without `type`
+    if ("assign" in current) {
+      return this.dispatchAgentState(workflowId, state, current, definition);
+    }
+
     if (current.type === "terminal") {
       // If this workflow has a parent, propagate completion
       if (state.parent) {
@@ -343,13 +348,15 @@ export class WorkflowEngine {
       return this.dispatchSubworkflow(workflowId, state, current, definition);
     }
 
-    // AgentState — has `assign`
-    if (!("assign" in current)) {
-      throw new Error(
-        `State ${state.current_state} has no assign, type, or subworkflow`,
-      );
-    }
+    throw new Error(`State ${state.current_state} has unrecognized type`);
+  }
 
+  private async dispatchAgentState(
+    workflowId: string,
+    state: WorkflowRuntimeState,
+    current: AgentState,
+    definition: WorkflowDefinition,
+  ): Promise<{ dispatched: boolean; details: string }> {
     const baseRole = definition.roles[current.assign];
     if (!baseRole) {
       throw new Error(`Role ${current.assign} not defined`);
@@ -360,8 +367,16 @@ export class WorkflowEngine {
       current.assign,
       this.projectConfig,
     );
-    const paramBoundRole = resolvePersonaFromParams(configuredRole, state.params);
-    const effectiveRole = resolvePersonaForDispatch(paramBoundRole, current.assign, state, definition);
+    const paramBoundRole = resolvePersonaFromParams(
+      configuredRole,
+      state.params,
+    );
+    const effectiveRole = resolvePersonaForDispatch(
+      paramBoundRole,
+      current.assign,
+      state,
+      definition,
+    );
 
     const agentId = asAgentId(`${workflowId}-${current.assign}`);
     await this.spawnAgent({
@@ -465,10 +480,7 @@ export class WorkflowEngine {
     }
 
     // Build child params from inputMap
-    const childParams = resolveInputMap(
-      subDef.inputMap ?? {},
-      parentState,
-    );
+    const childParams = resolveInputMap(subDef.inputMap ?? {}, parentState);
 
     // Start the child workflow
     const childState = this.start(childWorkflowType, childParams);
@@ -484,8 +496,7 @@ export class WorkflowEngine {
     if (!parentState.children) {
       parentState.children = {};
     }
-    parentState.children[parentState.current_state] =
-      childState.workflow_id;
+    parentState.children[parentState.current_state] = childState.workflow_id;
     parentState.updated_at = new Date().toISOString();
     this.store.saveWorkflowState(parentState);
 
@@ -521,9 +532,12 @@ export class WorkflowEngine {
       return;
     }
 
-    const parentStateDef =
-      parentDefinition.states[childState.parent.state];
-    if (!parentStateDef || parentStateDef.type !== "subworkflow") {
+    const parentStateDef = parentDefinition.states[childState.parent.state];
+    if (
+      !parentStateDef ||
+      !("type" in parentStateDef) ||
+      parentStateDef.type !== "subworkflow"
+    ) {
       return;
     }
 
@@ -744,7 +758,11 @@ export const applyRoleOverrides = (
   }
 
   const override = projectConfig.roles?.[roleName];
-  if (!override && !workflowRole.personaPool && !("personaTags" in workflowRole)) {
+  if (
+    !override &&
+    !workflowRole.personaPool &&
+    !("personaTags" in workflowRole)
+  ) {
     return workflowRole;
   }
 
@@ -773,16 +791,13 @@ export const applyRoleOverrides = (
   if (tags && tags.length > 0 && projectConfig.team.length > 0) {
     const tagSet = new Set(tags);
     const matchingPersonas = projectConfig.team
-      .filter(
-        (member) =>
-          member.tags && member.tags.some((tag) => tagSet.has(tag)),
-      )
+      .filter((member) => member.tags?.some((tag) => tagSet.has(tag)))
       .map((member) => member.persona);
 
     if (matchingPersonas.length > 0) {
-      merged.personaPool = matchingPersonas;
-      // Clear fixed persona — pool takes precedence
-      merged.persona = undefined;
+      // Pool takes precedence — strip fixed persona
+      const { persona: _fixed, ...withoutPersona } = merged;
+      merged = { ...withoutPersona, personaPool: matchingPersonas };
     }
   }
 
@@ -815,11 +830,11 @@ export const resolvePersonaFromParams = (
     return role;
   }
 
+  // Clear pool — param-specified persona is a direct assignment
+  const { personaPool: _pool, ...rest } = role;
   return {
-    ...role,
+    ...rest,
     persona: personaPath,
-    // Clear pool — param-specified persona is a direct assignment
-    personaPool: undefined,
   };
 };
 
@@ -864,8 +879,9 @@ export const resolvePersonaForDispatch = (
     statesForRole.has(entry.state),
   ).length;
 
-  const persona =
-    role.personaPool[roleDispatchCount % role.personaPool.length] as string;
+  const persona = role.personaPool[
+    roleDispatchCount % role.personaPool.length
+  ] as string;
 
   return { ...role, persona };
 };
@@ -887,9 +903,7 @@ export const resolveWorkflowSlot = (
   const slotName = workflow.slice(1);
   const slots = params.slots as Record<string, string> | undefined;
   if (!slots || typeof slots[slotName] !== "string") {
-    throw new Error(
-      `Subworkflow slot "${slotName}" not found in params.slots`,
-    );
+    throw new Error(`Subworkflow slot "${slotName}" not found in params.slots`);
   }
 
   return slots[slotName] as string;
@@ -943,7 +957,7 @@ export interface BuildAgentPromptInput {
   workflowDefinition: WorkflowDefinition;
   state: string;
   stateDefinition: AgentState;
-  projectConfig?: ProjectConfig;
+  projectConfig?: ProjectConfig | undefined;
   cwd: string;
 }
 
@@ -964,7 +978,9 @@ export const buildAgentPrompt = (input: BuildAgentPromptInput): string => {
     input.cwd,
   );
   if (agentDef) {
-    sections.push(`## Agent Definition (${input.roleDefinition.agent})\n\n${agentDef.trim()}`);
+    sections.push(
+      `## Agent Definition (${input.roleDefinition.agent})\n\n${agentDef.trim()}`,
+    );
   }
 
   // 3. Project context
@@ -1023,7 +1039,7 @@ export interface BuildAgentTaskInput {
   state: string;
   stateDefinition: AgentState;
   runtimeState: WorkflowRuntimeState;
-  projectConfig?: ProjectConfig;
+  projectConfig?: ProjectConfig | undefined;
 }
 
 export const buildAgentTask = (input: BuildAgentTaskInput): string => {
@@ -1059,7 +1075,9 @@ export const buildAgentTask = (input: BuildAgentTaskInput): string => {
 
   if (gate.kind === "evidence") {
     sections.push(
-      `### Example submit_evidence call\n\`\`\`json\n{\n  "state": "${input.state}",\n  "result": "pass",\n  "evidence": {\n${Object.entries(gate.schema)
+      `### Example submit_evidence call\n\`\`\`json\n{\n  "state": "${input.state}",\n  "result": "pass",\n  "evidence": {\n${Object.entries(
+        gate.schema,
+      )
         .map(([key, type]) => `    "${key}": "<${type}>"`)
         .join(",\n")}\n  }\n}\n\`\`\``,
     );

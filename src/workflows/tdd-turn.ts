@@ -1,8 +1,4 @@
-import {
-  defineWorkflow,
-  evidence,
-  verdict,
-} from "../core/workflow-definition";
+import { defineWorkflow, evidence, verdict } from "../core/workflow-definition";
 
 /**
  * A single TDD turn — one person's contribution to the ping-pong cycle.

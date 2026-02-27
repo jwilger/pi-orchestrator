@@ -53,7 +53,5 @@ export const subworkflow = (config: {
   workflow: config.workflow,
   ...(config.inputMap ? { inputMap: config.inputMap } : {}),
   transitions: config.transitions,
-  ...(config.maxRetries !== undefined
-    ? { maxRetries: config.maxRetries }
-    : {}),
+  ...(config.maxRetries !== undefined ? { maxRetries: config.maxRetries } : {}),
 });
