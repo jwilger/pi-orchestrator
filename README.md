@@ -32,6 +32,8 @@ GitHub Actions CI runs on every PR and push to `main`:
 - `test` (`npm test`)
 - `mutation` (`npm run test:mutate`)
 
+Mutation testing is configured to require **100% mutant kill rate** (`high/low/break = 100`).
+
 ## Releases and publishing
 
 - Semantic releases are managed by **Release Please** (`.github/workflows/release-please.yml`).

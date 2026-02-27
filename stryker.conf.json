@@ -14,8 +14,8 @@
   ],
   "coverageAnalysis": "off",
   "thresholds": {
-    "high": 80,
-    "low": 70,
-    "break": 0
+    "high": 100,
+    "low": 100,
+    "break": 100
   }
 }

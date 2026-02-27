@@ -396,9 +396,10 @@ export class WorkflowEngine {
   }
 }
 
-const shellEscape = (value: string): string => value.replace(/'/g, "'\\''");
+export const shellEscape = (value: string): string =>
+  value.replace(/'/g, "'\\''");
 
-const buildScopeExtension = (input: {
+export const buildScopeExtension = (input: {
   agentId: string;
   workflowId: string;
   writable: string[];
