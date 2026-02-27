@@ -1,0 +1,17 @@
+export default {
+  name: "pi-orchestrator",
+  flavor: "traditional-prd",
+  testRunner: "npm test",
+  buildCommand: "npm run typecheck",
+  lintCommand: "npm run lint",
+  formatCheck: "npm run lint",
+  mutationTool: "npm run test",
+  ciProvider: "github-actions",
+  testDir: "tests/**",
+  srcDir: "src/**",
+  typeDir: "src/**",
+  team: [],
+  autonomyLevel: "full",
+  humanReviewCadence: "end",
+  reworkBudget: 5,
+};
