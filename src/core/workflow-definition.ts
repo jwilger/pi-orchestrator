@@ -1,6 +1,7 @@
 import type {
   CommandGate,
   EvidenceGate,
+  SubworkflowState,
   VerdictGate,
   WorkflowDefinition,
 } from "./types";
@@ -28,4 +29,31 @@ export const command = (gate: {
 }): CommandGate => ({
   kind: "command",
   verify: gate.verify,
+});
+
+/**
+ * Define a state that delegates to a child workflow.
+ *
+ * `workflow` can be a literal name ("tdd-ping-pong") or a slot reference
+ * ("$build") that is resolved from `params.slots` at runtime.
+ *
+ * `inputMap` maps child param names to dotted paths in the parent runtime:
+ *   - "params.scenario"                → parent's params.scenario
+ *   - "evidence.SETUP.acceptance_criteria" → parent's evidence from SETUP
+ *
+ * Transitions key on the child's terminal result: "success" or "failure".
+ */
+export const subworkflow = (config: {
+  workflow: string;
+  inputMap?: Record<string, string>;
+  transitions: Record<string, string>;
+  maxRetries?: number;
+}): SubworkflowState => ({
+  type: "subworkflow",
+  workflow: config.workflow,
+  ...(config.inputMap ? { inputMap: config.inputMap } : {}),
+  transitions: config.transitions,
+  ...(config.maxRetries !== undefined
+    ? { maxRetries: config.maxRetries }
+    : {}),
 });
