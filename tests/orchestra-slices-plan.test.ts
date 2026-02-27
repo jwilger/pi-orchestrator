@@ -44,8 +44,27 @@ describe("orchestra self-hosting slice plan", () => {
     expect(workflow.name).toBe("orchestra-self-host-panel");
     expect(workflow.states).toBeDefined();
     const stateKeys = Object.keys(workflow.states ?? {});
+    expect(stateKeys).toContain("PRECHECK");
     expect(stateKeys).toContain("SLICE_1_PLAN");
+    expect(stateKeys).toContain("SLICE_1_PR_OPEN");
     expect(stateKeys).toContain("SLICE_5_REVIEW");
+    expect(stateKeys).toContain("SLICE_5_PR_MERGE");
     expect(stateKeys).toContain("COMPLETE");
+  });
+
+  it("ships orchestration helper scripts used by the workflow", () => {
+    const scripts = [
+      "precheck.sh",
+      "sync-main.sh",
+      "open-pr.sh",
+      "wait-pr-ready.sh",
+      "merge-pr.sh",
+      "pr-state.sh",
+    ];
+
+    for (const script of scripts) {
+      const file = path.join(process.cwd(), "scripts", "orchestra", script);
+      expect(fs.existsSync(file)).toBe(true);
+    }
   });
 });

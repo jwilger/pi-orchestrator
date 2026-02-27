@@ -63,6 +63,7 @@ export const buildCommandHelpLines = (): string[] => [
   "/orchestra status",
   "/orchestra dashboard [overview|workflows|tuning|panes|health] [page]",
   "/orchestra start <workflow> [jsonParams]",
+  "/orchestra autopilot [workflowId] [stop]",
   "/orchestra project",
   "/orchestra project-bootstrap [force]",
   "/orchestra cutline",

@@ -117,6 +117,113 @@ export default function (pi: ExtensionAPI): void {
   );
 
   let initialized = false;
+  const autopilotTimers = new Map<string, ReturnType<typeof setInterval>>();
+  const autopilotTokens = new Map<string, string>();
+
+  const isWorkflowTerminal = (workflowId: string): boolean => {
+    const workflow = engine.get(workflowId);
+    if (!workflow) {
+      return true;
+    }
+
+    const definition = engine.getDefinition(
+      workflow.workflow_type as unknown as string,
+    );
+    const stateDefinition = definition?.states[workflow.current_state];
+    if (!stateDefinition) {
+      return false;
+    }
+
+    return "type" in stateDefinition && stateDefinition.type === "terminal";
+  };
+
+  const startAutopilot = (
+    workflowId: string,
+    ctx?: ExtensionCommandContext,
+  ): { started: boolean; reason: string } => {
+    if (autopilotTimers.has(workflowId)) {
+      return { started: false, reason: "already running" };
+    }
+
+    if (!engine.get(workflowId)) {
+      return { started: false, reason: "unknown workflow" };
+    }
+
+    let running = false;
+    const tick = async () => {
+      if (running) {
+        return;
+      }
+      running = true;
+
+      try {
+        const workflow = engine.get(workflowId);
+        if (!workflow) {
+          stopAutopilot(workflowId);
+          return;
+        }
+
+        if (workflow.paused) {
+          return;
+        }
+
+        if (isWorkflowTerminal(workflowId)) {
+          stopAutopilot(workflowId);
+          ctx?.ui.notify(`autopilot complete: ${workflowId}`, "info");
+          return;
+        }
+
+        const historyEntry = workflow.history.at(-1);
+        const token = historyEntry
+          ? `${workflow.current_state}:${historyEntry.entered_at}:${historyEntry.retries}`
+          : workflow.current_state;
+
+        if (autopilotTokens.get(workflowId) === token) {
+          return;
+        }
+
+        autopilotTokens.set(workflowId, token);
+        const result = await engine.dispatchCurrentState(workflowId);
+        if (!result.dispatched && result.details.includes("terminal")) {
+          stopAutopilot(workflowId);
+        }
+      } catch (error) {
+        const message =
+          error instanceof Error ? error.message : "unknown error";
+        ctx?.ui.notify(`autopilot error (${workflowId}): ${message}`, "error");
+      } finally {
+        running = false;
+      }
+    };
+
+    const timer = setInterval(() => {
+      void tick();
+    }, 2000);
+    autopilotTimers.set(workflowId, timer);
+    void tick();
+    return { started: true, reason: "started" };
+  };
+
+  const stopAutopilot = (workflowId: string): boolean => {
+    const timer = autopilotTimers.get(workflowId);
+    if (!timer) {
+      return false;
+    }
+    clearInterval(timer);
+    autopilotTimers.delete(workflowId);
+    autopilotTokens.delete(workflowId);
+    return true;
+  };
+
+  const stopAllAutopilot = (): number => {
+    const ids = [...autopilotTimers.keys()];
+    for (const id of ids) {
+      stopAutopilot(id);
+    }
+    return ids.length;
+  };
+
+  const listAutopilot = (): string[] => [...autopilotTimers.keys()];
 
   const initialize = async (): Promise<void> => {
     if (initialized) {
@@ -152,6 +259,7 @@ export default function (pi: ExtensionAPI): void {
 
   pi.on("session_shutdown", async () => {
     scheduler.stop();
+    stopAllAutopilot();
     await bus.stop();
   });
 
@@ -797,6 +905,9 @@ export default function (pi: ExtensionAPI): void {
         projectConfig,
         scheduler,
         () => lastHealthResults,
+        startAutopilot,
+        stopAutopilot,
+        listAutopilot,
       );
     },
   });
@@ -887,6 +998,12 @@ const handleCommand = async (
   projectConfig: ReturnType<typeof loadProjectConfig>,
   scheduler: HealthScheduler,
   getHealthChecks: () => HealthCheckResult[],
+  startAutopilot: (
+    workflowId: string,
+    ctx?: ExtensionCommandContext,
+  ) => { started: boolean; reason: string },
+  stopAutopilot: (workflowId: string) => boolean,
+  listAutopilot: () => string[],
 ): Promise<void> => {
   const [command, ...rest] = args.trim().split(/\s+/);
 
@@ -938,6 +1055,46 @@ const handleCommand = async (
       const message = error instanceof Error ? error.message : "invalid input";
       ctx.ui.notify(`dashboard error: ${message}`, "error");
     }
+    return;
+  }
+
+  if (command === "autopilot") {
+    const workflowId = rest[0];
+    if (!workflowId) {
+      const running = listAutopilot();
+      ctx.ui.setWidget(
+        "orchestra-autopilot",
+        running.length > 0
+          ? ["running:", ...running.map((id) => `- ${id}`)]
+          : ["no active autopilot workflows"],
+      );
+      ctx.ui.notify(
+        running.length > 0
+          ? `autopilot active: ${running.length}`
+          : "autopilot idle",
+        "info",
+      );
+      return;
+    }
+
+    if (rest[1] === "stop") {
+      const stopped = stopAutopilot(workflowId);
+      ctx.ui.notify(
+        stopped
+          ? `autopilot stopped: ${workflowId}`
+          : `autopilot not running: ${workflowId}`,
+        stopped ? "warning" : "info",
+      );
+      return;
+    }
+
+    const result = startAutopilot(workflowId, ctx);
+    ctx.ui.notify(
+      result.started
+        ? `autopilot started: ${workflowId}`
+        : `autopilot not started (${result.reason}): ${workflowId}`,
+      result.started ? "info" : "warning",
+    );
     return;
   }
 
