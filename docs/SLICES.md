@@ -31,10 +31,19 @@ pause/resume, focus/close zellij pane) without relying on truncated widgets.
 
 ## Suggested workflow commands
 
-- `/orchestra start orchestra-self-host-panel {"objective":"Implement S1 only"}`
+- `/orchestra start orchestra-self-host-panel {"objective":"Complete S1-S5 autonomously with PR-per-slice","persona_a":"src/agents/tdd-red.md","persona_b":"src/agents/tdd-green.md"}`
 - `/orchestra workflow <id>`
 - `/orchestra dispatch <id>`
 - `/orchestra retro-show <id>`
+
+## Automation scripts used by the workflow
+
+- `scripts/orchestra/precheck.sh`
+- `scripts/orchestra/sync-main.sh`
+- `scripts/orchestra/open-pr.sh`
+- `scripts/orchestra/wait-pr-ready.sh`
+- `scripts/orchestra/merge-pr.sh`
+- `scripts/orchestra/pr-state.sh`
 
 ## Source of truth
 
