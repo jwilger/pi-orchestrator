@@ -7,5 +7,6 @@ describe("cutline status", () => {
     expect(cutline.branch).toBe("feat/prd-foundation-phase1");
     expect(cutline.shipNow.length).toBeGreaterThan(3);
     expect(cutline.deferred.length).toBeGreaterThan(0);
+    expect(cutline.deferred.some((item) => item.includes("S1:"))).toBe(true);
   });
 });

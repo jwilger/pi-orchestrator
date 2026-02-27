@@ -26,4 +26,9 @@ All previously deferred follow-on milestones are now implemented:
 
 ## Remaining deferred items
 
-- None.
+- Self-hosted interactive control panel delivery via ping-pong TDD slices (see `docs/SLICES.md`)
+  - S1: command entrypoint + panel launcher seam
+  - S2: read-only interactive panel rendering/navigation
+  - S3: workflow action controls (dispatch/pause/resume)
+  - S4: pane action controls (focus/close/workflow->pane jump)
+  - S5: hardening/docs/help updates + evidence trail
