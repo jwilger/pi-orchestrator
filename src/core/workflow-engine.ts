@@ -43,9 +43,10 @@ export class WorkflowEngine {
     }
 
     const jiti = createJiti(import.meta.url);
-    for (const entry of fs
-      .readdirSync(directory)
-      .filter((f) => f.endsWith(".ts") || f.endsWith(".js"))) {
+    for (const entry of fs.readdirSync(directory).filter((f) => {
+      const ext = path.extname(f);
+      return ext === ".ts" || ext === ".js";
+    })) {
       const modulePath = path.join(directory, entry);
       const loaded = (await jiti.import(modulePath)) as
         | WorkflowDefinition
@@ -141,19 +142,20 @@ export class WorkflowEngine {
     }
 
     let verified = true;
-    if (
-      currentDefinition.gate.kind === "evidence" &&
-      currentDefinition.gate.verify
-    ) {
+    if (currentDefinition.gate.kind === "evidence") {
       const verify = currentDefinition.gate.verify;
-      const result = await this.execCommand(verify.command);
-      verified = result.code === (verify.expectExitCode ?? 0);
+      if (verify) {
+        const result = await this.execCommand(verify.command);
+        const expectedExitCode = verify.expectExitCode ?? 0;
+        verified = result.code === expectedExitCode;
+      }
     }
 
     if (currentDefinition.gate.kind === "command") {
       const verify = currentDefinition.gate.verify;
       const result = await this.execCommand(verify.command);
-      verified = result.code === (verify.expectExitCode ?? 0);
+      const expectedExitCode = verify.expectExitCode ?? 0;
+      verified = result.code === expectedExitCode;
     }
 
     if (currentDefinition.gate.kind === "verdict") {
@@ -161,13 +163,14 @@ export class WorkflowEngine {
     }
 
     const historyEntry = state.history.at(-1);
+    if (!historyEntry) {
+      throw new Error(`Workflow history missing for ${workflowId}`);
+    }
 
     if (!verified) {
       state.retry_count += 1;
-      if (historyEntry) {
-        historyEntry.retries = state.retry_count;
-        historyEntry.last_failure = `Gate verification failed for ${state.current_state}`;
-      }
+      historyEntry.retries = state.retry_count;
+      historyEntry.last_failure = `Gate verification failed for ${state.current_state}`;
 
       const retryLimit =
         "maxRetries" in currentDefinition
@@ -200,19 +203,19 @@ export class WorkflowEngine {
       submitted_at: new Date().toISOString(),
     };
 
-    const transitionKey =
-      submission.result in currentDefinition.transitions
-        ? submission.result
-        : "pass";
-    const next =
-      currentDefinition.transitions[transitionKey] ??
-      currentDefinition.transitions.pass;
+    const hasDirectTransition = Object.hasOwn(
+      currentDefinition.transitions,
+      submission.result,
+    );
+    const next = hasDirectTransition
+      ? currentDefinition.transitions[submission.result]
+      : currentDefinition.transitions.pass;
     if (!next) {
       throw new Error(`No transition for state ${state.current_state}`);
     }
 
     state.retry_count = 0;
-    this.moveState(state, next, transitionKey);
+    this.moveState(state, next, submission.result);
     this.store.saveWorkflowState(state);
 
     return {
@@ -273,14 +276,14 @@ export class WorkflowEngine {
       throw new Error(`Unknown state ${state.current_state}`);
     }
 
-    if ("type" in current && current.type === "terminal") {
-      return {
-        dispatched: false,
-        details: `Workflow is terminal: ${current.result}`,
-      };
-    }
+    if (!("assign" in current)) {
+      if (current.type === "terminal") {
+        return {
+          dispatched: false,
+          details: `Workflow is terminal: ${current.result}`,
+        };
+      }
 
-    if ("type" in current && current.type === "action") {
       for (const cmd of current.commands) {
         await this.execCommand(cmd);
       }
@@ -334,19 +337,16 @@ export class WorkflowEngine {
         workflowId: input.workflowId,
         writable: input.roleDefinition.fileScope.writable,
       }),
-      "utf8",
     );
 
     fs.writeFileSync(
       promptPath,
       `# Role ${input.role}\n\nWorkflow: ${input.workflowId}\nState: ${input.state}\n\nFollow tool scope strictly.`,
-      "utf8",
     );
 
     fs.writeFileSync(
       taskPath,
       `Execute state ${input.state} for workflow ${input.workflowId}. Submit evidence when done.`,
-      "utf8",
     );
 
     await this.execCommand(
@@ -361,10 +361,12 @@ export class WorkflowEngine {
   ): void {
     const now = new Date().toISOString();
     const currentHistory = state.history.at(-1);
-    if (currentHistory) {
-      currentHistory.exited_at = now;
-      currentHistory.result = result;
+    if (!currentHistory) {
+      throw new Error(`Workflow history missing for ${state.workflow_id}`);
     }
+
+    currentHistory.exited_at = now;
+    currentHistory.result = result;
 
     state.current_state = nextState;
     state.updated_at = now;

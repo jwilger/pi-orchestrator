@@ -14,6 +14,18 @@ describe("StateStore", () => {
     expect(store.listWorkflows()).toEqual([]);
   });
 
+  it("ignores workflow directories missing state files", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "orchestra-store-"));
+    const store = new StateStore(path.join(root, ".orchestra"));
+    store.ensure();
+
+    fs.mkdirSync(path.join(root, ".orchestra", "workflows", "dangling"), {
+      recursive: true,
+    });
+
+    expect(store.listWorkflows()).toEqual([]);
+  });
+
   it("saves, loads, and lists workflow states", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "orchestra-store-"));
     const store = new StateStore(path.join(root, ".orchestra"));
@@ -24,8 +36,10 @@ describe("StateStore", () => {
     expect(fs.existsSync(path.join(root, ".orchestra", "runtime"))).toBe(true);
     expect(fs.existsSync(path.join(root, ".orchestra", "evidence"))).toBe(true);
 
+    store.ensure();
+
     const a = {
-      workflow_id: asWorkflowId("wf-a"),
+      workflow_id: asWorkflowId("wf-z"),
       workflow_type: asWorkflowType("type-a"),
       current_state: "ONE",
       retry_count: 0,
@@ -42,7 +56,7 @@ describe("StateStore", () => {
 
     const b = {
       ...a,
-      workflow_id: asWorkflowId("wf-b"),
+      workflow_id: asWorkflowId("wf-a"),
       workflow_type: asWorkflowType("type-b"),
       current_state: "TWO",
       created_at: "2026-01-02T00:00:00Z",
@@ -52,14 +66,14 @@ describe("StateStore", () => {
     store.saveWorkflowState(b);
     store.saveWorkflowState(a);
 
-    expect(store.loadWorkflowState(asWorkflowId("wf-a"))?.current_state).toBe(
+    expect(store.loadWorkflowState(asWorkflowId("wf-z"))?.current_state).toBe(
       "ONE",
     );
 
     const listed = store.listWorkflows();
     expect(listed.map((item) => item.workflow_id)).toEqual([
+      asWorkflowId("wf-z"),
       asWorkflowId("wf-a"),
-      asWorkflowId("wf-b"),
     ]);
   });
 });

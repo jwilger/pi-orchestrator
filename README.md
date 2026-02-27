@@ -52,3 +52,35 @@ Required repo secret:
 - 1 approving review
 - Passing required checks: `lint`, `typecheck`, `test`, `mutation`
 - Up-to-date branch before merge
+
+## Orchestra command quick reference
+
+- `/orchestra help`
+- `/orchestra status`
+- `/orchestra start <workflow> [jsonParams]`
+- `/orchestra workflow <workflowId>`
+- `/orchestra dispatch <workflowId>`
+- `/orchestra pause <workflowId>`
+- `/orchestra resume <workflowId>`
+- `/orchestra panes`
+- `/orchestra pane-focus <paneId|paneName>`
+- `/orchestra pane-close <paneId|paneName>`
+- `/orchestra tuning`
+- `/orchestra observe`
+- `/orchestra project`
+- `/orchestra cutline`
+- `/orchestra readiness`
+- `/orchestra actions`
+- `/orchestra retro-show [workflowId]`
+- `/orchestra retro-materialize <workflowId> [apply]`
+- `/orchestra retro-apply [workflowId|path/to/proposals.json] [apply]`
+- `/orchestra retro-pipeline <workflowId> [apply]`
+
+## Project configuration
+
+Orchestra loads project config from:
+
+1. `.orchestra/project.ts` (preferred)
+2. `.orchestra/project.json` (fallback)
+
+If neither exists, built-in defaults are used.
