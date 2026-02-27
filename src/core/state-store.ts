@@ -26,7 +26,6 @@ export class StateStore {
     fs.writeFileSync(
       this.statePath(state.workflow_id),
       JSON.stringify(state, null, 2),
-      "utf8",
     );
   }
 
