@@ -484,7 +484,8 @@ export class WorkflowEngine {
     fs.mkdirSync(sessionDir, { recursive: true });
 
     const agentCommand = `pi --tools ${shellEscape(input.roleDefinition.tools.join(","))} -e ${shellEscape(scopePath)} --append-system-prompt ${shellEscape(promptPath)} --session-dir ${shellEscape(sessionDir)} @${shellEscape(taskPath)}`;
-    const command = `zellij action new-tab --name ${shellEscape(input.agentId)} --cwd ${shellEscape(this.cwd)} && zellij action write-chars ${shellEscape(agentCommand)} && zellij action write 13`;
+    const quotedAgentCommand = `'${agentCommand}'`;
+    const command = `zellij action new-tab --name ${shellEscape(input.agentId)} --cwd ${shellEscape(this.cwd)} && zellij action write-chars ${quotedAgentCommand} && zellij action write 13`;
     const result = await this.execCommand(command);
     return { ...result, command };
   }
