@@ -9,6 +9,7 @@ import {
   command,
   defineWorkflow,
   evidence,
+  subworkflow,
   verdict,
 } from "../src/core/workflow-definition";
 
@@ -28,6 +29,26 @@ describe("workflow-definition helpers", () => {
     const cmd = command({ verify: { command: "echo ok" } });
     expect(cmd.kind).toBe("command");
     expect(cmd.verify.command).toBe("echo ok");
+
+    const sub = subworkflow({
+      workflow: "$build",
+      inputMap: { scenario: "evidence.SETUP.slice" },
+      transitions: { success: "REVIEW", failure: "ESCALATE" },
+      maxRetries: 3,
+    });
+    expect(sub.type).toBe("subworkflow");
+    expect(sub.workflow).toBe("$build");
+    expect(sub.inputMap).toEqual({ scenario: "evidence.SETUP.slice" });
+    expect(sub.transitions).toEqual({ success: "REVIEW", failure: "ESCALATE" });
+    expect(sub.maxRetries).toBe(3);
+
+    const subMinimal = subworkflow({
+      workflow: "tdd-ping-pong",
+      transitions: { success: "DONE" },
+    });
+    expect(subMinimal.type).toBe("subworkflow");
+    expect(subMinimal.inputMap).toBeUndefined();
+    expect(subMinimal.maxRetries).toBeUndefined();
   });
 
   it("returns workflow definitions unchanged", () => {

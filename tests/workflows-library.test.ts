@@ -7,6 +7,7 @@ import pipeline from "../src/workflows/pipeline";
 import prd from "../src/workflows/prd";
 import retro from "../src/workflows/retro";
 import tddPingPong from "../src/workflows/tdd-ping-pong";
+import tddTurn from "../src/workflows/tdd-turn";
 import threeStageReview from "../src/workflows/three-stage-review";
 
 describe("workflow library", () => {
@@ -14,6 +15,7 @@ describe("workflow library", () => {
     const names = [
       consensusDecision.name,
       tddPingPong.name,
+      tddTurn.name,
       threeStageReview.name,
       pipeline.name,
       discovery.name,
@@ -26,6 +28,7 @@ describe("workflow library", () => {
     expect(names).toEqual([
       "consensus-decision",
       "tdd-ping-pong",
+      "tdd-turn",
       "three-stage-review",
       "pipeline",
       "discovery",
@@ -43,5 +46,24 @@ describe("workflow library", () => {
     expect(Object.keys(discovery.states)).toContain("COMPLETE");
     expect(Object.keys(eventModeling.states)).toContain("COMPLETE");
     expect(Object.keys(prd.states)).toContain("COMPLETE");
+  });
+
+  it("tdd-ping-pong composes tdd-turn subworkflows", () => {
+    const turnA = tddPingPong.states.TURN_A;
+    const turnB = tddPingPong.states.TURN_B;
+    expect(turnA).toMatchObject({ type: "subworkflow", workflow: "tdd-turn" });
+    expect(turnB).toMatchObject({ type: "subworkflow", workflow: "tdd-turn" });
+
+    // Personas come from params, not hardcoded
+    expect(tddPingPong.params?.persona_a).toMatchObject({ required: true });
+    expect(tddPingPong.params?.persona_b).toMatchObject({ required: true });
+  });
+
+  it("tdd-turn roles inherit persona from params via personaFrom", () => {
+    for (const roleName of ["triage", "red", "green"]) {
+      const role = tddTurn.roles[roleName];
+      expect(role).toBeDefined();
+      expect(role?.personaFrom).toBe("turn_persona");
+    }
   });
 });
