@@ -1,0 +1,50 @@
+{
+  "name": "@jwilger/pi-orchestrator",
+  "version": "0.1.0",
+  "description": "Deterministic multi-agent SDLC orchestration for pi",
+  "type": "module",
+  "keywords": ["pi-package", "pi", "orchestra", "orchestrator"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jwilger/pi-orchestrator.git"
+  },
+  "homepage": "https://github.com/jwilger/pi-orchestrator#readme",
+  "bugs": {
+    "url": "https://github.com/jwilger/pi-orchestrator/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "pi": {
+    "extensions": ["./src/extension/index.ts"]
+  },
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:mutate": "stryker run",
+    "lint": "biome check src tests docs .orchestra README.md package.json tsconfig.json",
+    "lint:fix": "biome check --write src tests docs .orchestra README.md package.json tsconfig.json",
+    "typecheck": "tsc --noEmit",
+    "ci": "npm run lint && npm run typecheck && npm test && npm run test:mutate"
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-ai": "*",
+    "@mariozechner/pi-coding-agent": "*",
+    "@mariozechner/pi-tui": "*",
+    "@sinclair/typebox": "*"
+  },
+  "dependencies": {
+    "jiti": "^2.4.2",
+    "minimatch": "^10.0.3",
+    "nanoid": "^5.1.6"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^1.9.4",
+    "@stryker-mutator/core": "^9.3.0",
+    "@stryker-mutator/vitest-runner": "^9.3.0",
+    "@types/node": "^24.4.0",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "$schema": "https://raw.githubusercontent.com/stryker-mutator/stryker-js/master/packages/core/schema/stryker-schema.json",
+  "testRunner": "vitest",
+  "vitest": {
+    "related": false
+  },
+  "reporters": ["clear-text", "progress", "html"],
+  "mutate": ["src/core/**/*.ts"],
+  "ignorePatterns": [
+    "**/*.d.ts",
+    ".direnv/**",
+    "node_modules/**",
+    ".orchestra/runtime/**"
+  ],
+  "coverageAnalysis": "off",
+  "thresholds": {
+    "high": 80,
+    "low": 70,
+    "break": 0
+  }
+}
