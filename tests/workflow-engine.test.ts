@@ -647,7 +647,10 @@ describe("WorkflowEngine", () => {
     );
     expect(calls.at(-1)?.bin).toBe("bash");
     expect(calls.at(-1)?.args[0]).toBe("-lc");
-    expect(calls.at(-1)?.args[1]).toContain("--tools read,bash");
+    expect(calls.at(-1)?.args[1]).toContain(
+      "write-chars 'pi --tools read,bash",
+    );
+    expect(calls.at(-1)?.args[1]).toContain("&& zellij action write 13");
     expect(calls.at(-1)?.args[1]).toContain("--append-system-prompt");
     // Should NOT use headless flags — agents are interactive TUI sessions
     expect(calls.at(-1)?.args[1]).not.toContain("--mode json");
