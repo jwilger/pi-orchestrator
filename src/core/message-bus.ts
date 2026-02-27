@@ -35,14 +35,12 @@ export class MessageBus {
   }): Promise<void> {
     this.replayWal();
     fs.mkdirSync(path.dirname(this.socketPath), { recursive: true });
-    if (fs.existsSync(this.socketPath)) {
-      fs.unlinkSync(this.socketPath);
-    }
+    fs.rmSync(this.socketPath, { force: true });
 
     this.server = http.createServer(async (req, res) => {
       try {
-        const url = req.url ?? "/";
-        const method = req.method ?? "GET";
+        const url = req.url as string;
+        const method = req.method as string;
 
         if (method === "POST" && url === "/messages") {
           const body = await readBody(req);
@@ -102,8 +100,9 @@ export class MessageBus {
       }
     });
 
+    const server = this.server;
     return new Promise((resolve) => {
-      this.server?.listen(this.socketPath, () => {
+      server.listen(this.socketPath, () => {
         fs.chmodSync(this.socketPath, 0o600);
         resolve();
       });
@@ -115,8 +114,9 @@ export class MessageBus {
       return;
     }
 
+    const server = this.server;
     await new Promise<void>((resolve, reject) => {
-      this.server?.close((error) => {
+      server.close((error) => {
         if (error) {
           reject(error);
           return;
@@ -125,9 +125,7 @@ export class MessageBus {
       });
     });
 
-    if (fs.existsSync(this.socketPath)) {
-      fs.unlinkSync(this.socketPath);
-    }
+    fs.rmSync(this.socketPath, { force: true });
   }
 
   send(
@@ -156,9 +154,12 @@ export class MessageBus {
     };
 
     this.messages.set(message.id, message);
-    const queue = this.inboxes.get(message.to) ?? [];
-    queue.push(message.id);
-    this.inboxes.set(message.to, queue);
+    const existingQueue = this.inboxes.get(message.to);
+    if (existingQueue) {
+      existingQueue.push(message.id);
+    } else {
+      this.inboxes.set(message.to, [message.id]);
+    }
     this.appendWal({ type: "send", message });
     this.deliverIfWaiting(message.to);
     return message;
@@ -171,11 +172,16 @@ export class MessageBus {
     }
 
     this.messages.delete(messageId);
-    const queue = this.inboxes.get(message.to) ?? [];
-    this.inboxes.set(
-      message.to,
-      queue.filter((id) => id !== messageId),
-    );
+    const queue = this.inboxes.get(message.to);
+    if (queue) {
+      const index = queue.indexOf(messageId);
+      if (index >= 0) {
+        queue.splice(index, 1);
+      }
+      if (queue.length === 0) {
+        this.inboxes.delete(message.to);
+      }
+    }
     if (persist) {
       this.appendWal({ type: "ack", messageId });
     }
@@ -200,17 +206,24 @@ export class MessageBus {
   }
 
   private drain(agentId: AgentId): Message[] {
-    const queue = this.inboxes.get(agentId) ?? [];
-    const messages = queue.flatMap((id) => {
+    const queue = this.inboxes.get(agentId);
+    if (!queue) {
+      return [];
+    }
+
+    const messages: Message[] = [];
+    for (const id of queue) {
       const message = this.messages.get(id);
-      return message ? [message] : [];
-    });
+      if (message) {
+        messages.push(message);
+      }
+    }
     return messages;
   }
 
   private deliverIfWaiting(agentId: AgentId): void {
-    const waiters = this.waiters.get(agentId) ?? [];
-    if (waiters.length === 0) {
+    const waiters = this.waiters.get(agentId);
+    if (!waiters || waiters.length === 0) {
       return;
     }
 
@@ -230,7 +243,11 @@ export class MessageBus {
     agentId: AgentId,
     resolver: (messages: Message[]) => void,
   ): void {
-    const waiters = this.waiters.get(agentId) ?? [];
+    const waiters = this.waiters.get(agentId);
+    if (!waiters) {
+      return;
+    }
+
     this.waiters.set(
       agentId,
       waiters.filter((entry) => entry.resolve !== resolver),
@@ -239,7 +256,7 @@ export class MessageBus {
 
   private appendWal(event: WalEvent): void {
     fs.mkdirSync(path.dirname(this.walPath), { recursive: true });
-    fs.appendFileSync(this.walPath, `${JSON.stringify(event)}\n`, "utf8");
+    fs.appendFileSync(this.walPath, `${JSON.stringify(event)}\n`);
   }
 
   private replayWal(): void {
@@ -253,20 +270,24 @@ export class MessageBus {
       .filter(Boolean);
     for (const line of lines) {
       const event = JSON.parse(line) as WalEvent;
-      if (event.type === "send") {
-        const message = event.message;
-        this.messages.set(message.id, message);
-        const queue = this.inboxes.get(message.to) ?? [];
-        queue.push(message.id);
-        this.inboxes.set(message.to, queue);
-      }
-
-      if (event.type === "ack") {
-        this.ack(event.messageId, false);
-      }
-
-      if (event.type === "dead-letter") {
-        this.deadLetters.push(event.message);
+      switch (event.type) {
+        case "send": {
+          const message = event.message;
+          this.messages.set(message.id, message);
+          const queue = this.inboxes.get(message.to);
+          if (queue) {
+            queue.push(message.id);
+          } else {
+            this.inboxes.set(message.to, [message.id]);
+          }
+          break;
+        }
+        case "ack":
+          this.ack(event.messageId, false);
+          break;
+        case "dead-letter":
+          this.deadLetters.push(event.message);
+          break;
       }
     }
   }
