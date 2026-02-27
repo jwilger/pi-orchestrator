@@ -8,20 +8,34 @@ import { MessageBus } from "../core/message-bus";
 import { StateStore } from "../core/state-store";
 import { WorkflowEngine } from "../core/workflow-engine";
 import {
+  buildWorkflowEvidenceDiagnostics,
+  collectEvidenceSchemas,
+} from "../evidence/schema-registry";
+import {
+  type DashboardSection,
   buildActionLines,
   buildCommandHelpLines,
+  buildInteractiveDashboardLines,
   buildOverviewLines,
   buildRetroApplyLines,
   buildTuningLines,
   buildWorkflowDetailLines,
   buildWorkflowLines,
 } from "../observability/dashboard";
+import { bootstrapProjectConfig } from "../project/bootstrap";
 import { loadProjectConfig } from "../project/config";
 import { buildCutlineStatus } from "../project/cutline";
 import { buildReadinessReport } from "../project/readiness";
 import { RetroProposalApplier } from "../retro/proposal-applier";
 import { RetroProposalArtifact } from "../retro/proposal-artifact";
-import { ZellijSupervisor } from "../runtime/zellij-supervisor";
+import {
+  type HealthCheckResult,
+  HealthScheduler,
+} from "../runtime/health-scheduler";
+import {
+  type PaneSpawnSpec,
+  ZellijSupervisor,
+} from "../runtime/zellij-supervisor";
 import { ModelTuner } from "../tuning/model-tuner";
 
 const asToolResult = (payload: unknown) => ({
@@ -34,7 +48,7 @@ export default function (pi: ExtensionAPI): void {
   const store = new StateStore(root);
   store.ensure();
 
-  const projectConfig = loadProjectConfig(process.cwd());
+  let projectConfig = loadProjectConfig(process.cwd());
   const engine = new WorkflowEngine(pi, process.cwd(), store);
   const tuner = new ModelTuner(path.join(root, "tuning"));
   const retro = new RetroProposalApplier(process.cwd());
@@ -43,6 +57,63 @@ export default function (pi: ExtensionAPI): void {
   const bus = new MessageBus(
     path.join(root, "bus.sock"),
     path.join(root, "bus.wal"),
+  );
+
+  let lastHealthResults: HealthCheckResult[] = [];
+  let lastHealthEscalation:
+    | {
+        at: string;
+        streak: number;
+        failing: HealthCheckResult[];
+        pausedWorkflows: string[];
+      }
+    | undefined;
+  const scheduler = new HealthScheduler(
+    30_000,
+    [
+      async () => {
+        const workflows = engine.list();
+        const paused = workflows.filter((workflow) => workflow.paused).length;
+        return {
+          name: "workflows",
+          ok: true,
+          message: `workflows=${workflows.length} paused=${paused}`,
+        };
+      },
+      async () => {
+        const panes = await zellij.listPanes();
+        return {
+          name: "panes",
+          ok: panes.length > 0 || engine.list().length === 0,
+          message: `panes=${panes.length}`,
+        };
+      },
+      () => {
+        const recommendations = tuner.listRecommendations();
+        return {
+          name: "tuning",
+          ok: true,
+          message: `recommendations=${recommendations.length}`,
+        };
+      },
+    ],
+    (results) => {
+      lastHealthResults = results;
+    },
+    (escalation) => {
+      const pausedWorkflows = engine
+        .list()
+        .filter((workflow) => !workflow.paused)
+        .map((workflow) => {
+          engine.pause(workflow.workflow_id as unknown as string);
+          return workflow.workflow_id as unknown as string;
+        });
+
+      lastHealthEscalation = {
+        ...escalation,
+        pausedWorkflows,
+      };
+    },
   );
 
   let initialized = false;
@@ -68,10 +139,19 @@ export default function (pi: ExtensionAPI): void {
 
   pi.on("session_start", async (_event, ctx) => {
     await initialize();
-    ctx.ui.setStatus("orchestra", "orchestra: ready");
+    scheduler.start();
+    const results = await scheduler.runOnce();
+    const failing = results.filter((result) => !result.ok).length;
+    ctx.ui.setStatus(
+      "orchestra",
+      failing > 0
+        ? `orchestra: ready (health warnings=${failing})`
+        : "orchestra: ready",
+    );
   });
 
   pi.on("session_shutdown", async () => {
+    scheduler.stop();
     await bus.stop();
   });
 
@@ -143,7 +223,56 @@ export default function (pi: ExtensionAPI): void {
     parameters: Type.Object({}),
     async execute() {
       await initialize();
+      projectConfig = loadProjectConfig(process.cwd());
       return asToolResult(projectConfig);
+    },
+  });
+
+  pi.registerTool({
+    name: "orchestra_project_bootstrap",
+    label: "Orchestra Project Bootstrap",
+    description: "Generate .orchestra/project.ts from packaged defaults",
+    parameters: Type.Object({
+      force: Type.Optional(Type.Boolean({ default: false })),
+      name: Type.Optional(Type.String()),
+      flavor: Type.Optional(
+        Type.Union([
+          Type.Literal("event-modeled"),
+          Type.Literal("traditional-prd"),
+        ]),
+      ),
+      autonomyLevel: Type.Optional(
+        Type.Union([
+          Type.Literal("full"),
+          Type.Literal("assisted"),
+          Type.Literal("manual"),
+        ]),
+      ),
+      humanReviewCadence: Type.Optional(
+        Type.Union([
+          Type.Literal("every-slice"),
+          Type.Literal("every-n"),
+          Type.Literal("end"),
+        ]),
+      ),
+    }),
+    async execute(_toolCallId, params) {
+      await initialize();
+      const result = bootstrapProjectConfig(process.cwd(), {
+        force: params.force ?? false,
+        overrides: {
+          ...(params.name ? { name: params.name } : {}),
+          ...(params.flavor ? { flavor: params.flavor } : {}),
+          ...(params.autonomyLevel
+            ? { autonomyLevel: params.autonomyLevel }
+            : {}),
+          ...(params.humanReviewCadence
+            ? { humanReviewCadence: params.humanReviewCadence }
+            : {}),
+        },
+      });
+      projectConfig = loadProjectConfig(process.cwd());
+      return asToolResult({ result, projectConfig });
     },
   });
 
@@ -195,7 +324,67 @@ export default function (pi: ExtensionAPI): void {
         sampleCount: tuner.listSamples().length,
         summaries: tuner.summarizeByRolePhase(),
         recommendations: tuner.listRecommendations(),
+        experiments: tuner.listExperiments(),
+        assignments: tuner.listAssignments(),
       });
+    },
+  });
+
+  pi.registerTool({
+    name: "orchestra_tuning_experiment_create",
+    label: "Orchestra Tuning Experiment Create",
+    description:
+      "Create tuning A/B experiments from recommendation or explicit models",
+    parameters: Type.Object({
+      role: Type.Optional(Type.String()),
+      phase: Type.Optional(Type.String()),
+      baselineModel: Type.Optional(Type.String()),
+      challengerModel: Type.Optional(Type.String()),
+      fromRecommendations: Type.Optional(Type.Boolean()),
+    }),
+    async execute(_toolCallId, params) {
+      await initialize();
+      if (params.fromRecommendations) {
+        const created = tuner.createExperimentsFromRecommendations();
+        return asToolResult({ created, total: created.length });
+      }
+
+      if (
+        !params.role ||
+        !params.phase ||
+        !params.baselineModel ||
+        !params.challengerModel
+      ) {
+        throw new Error(
+          "role, phase, baselineModel, and challengerModel are required unless fromRecommendations=true",
+        );
+      }
+
+      const created = tuner.createExperiment({
+        role: params.role,
+        phase: params.phase,
+        baseline_model: params.baselineModel,
+        challenger_model: params.challengerModel,
+      });
+      return asToolResult({ created });
+    },
+  });
+
+  pi.registerTool({
+    name: "orchestra_tuning_experiment_run",
+    label: "Orchestra Tuning Experiment Run",
+    description: "Run pending tuning A/B experiments and apply rollback policy",
+    parameters: Type.Object({
+      minSamplesPerModel: Type.Optional(Type.Number({ minimum: 1 })),
+      rollbackDeltaThreshold: Type.Optional(Type.Number({ minimum: 0 })),
+      costWeight: Type.Optional(Type.Number({ minimum: 0 })),
+      latencyWeight: Type.Optional(Type.Number({ minimum: 0 })),
+      retryWeight: Type.Optional(Type.Number({ minimum: 0 })),
+    }),
+    async execute(_toolCallId, params) {
+      await initialize();
+      const result = tuner.runExperiments(params);
+      return asToolResult(result);
     },
   });
 
@@ -223,6 +412,28 @@ export default function (pi: ExtensionAPI): void {
       await initialize();
       const panes = await zellij.listPanes();
       return asToolResult({ paneCount: panes.length, panes });
+    },
+  });
+
+  pi.registerTool({
+    name: "orchestra_pane_recover",
+    label: "Orchestra Pane Recover",
+    description: "Reconcile expected zellij panes and respawn missing panes",
+    parameters: Type.Object({
+      expected: Type.Array(
+        Type.Object({
+          name: Type.String(),
+          cwd: Type.String(),
+          command: Type.Array(Type.String()),
+        }),
+      ),
+    }),
+    async execute(_toolCallId, params) {
+      await initialize();
+      return asToolResult({
+        ...(await zellij.reconcilePanes(params.expected)),
+        tracked: zellij.getTrackedPaneIds(),
+      });
     },
   });
 
@@ -399,6 +610,94 @@ export default function (pi: ExtensionAPI): void {
   });
 
   pi.registerTool({
+    name: "orchestra_dashboard_view",
+    label: "Orchestra Dashboard View",
+    description: "Render rich dashboard sections with table-oriented views",
+    parameters: Type.Object({
+      section: Type.Optional(
+        Type.Union([
+          Type.Literal("overview"),
+          Type.Literal("workflows"),
+          Type.Literal("tuning"),
+          Type.Literal("panes"),
+          Type.Literal("health"),
+        ]),
+      ),
+      page: Type.Optional(Type.Number({ minimum: 1, default: 1 })),
+      pageSize: Type.Optional(
+        Type.Number({ minimum: 1, maximum: 25, default: 8 }),
+      ),
+    }),
+    async execute(_toolCallId, params) {
+      await initialize();
+      const workflows = engine.list();
+      const panes = await zellij.listPanes();
+      const recommendations = tuner.listRecommendations();
+      const experiments = tuner.listExperiments();
+      const assignments = tuner.listAssignments();
+      const checks = lastHealthResults;
+      const section = parseDashboardSection(params.section);
+      const lines = buildInteractiveDashboardLines({
+        section,
+        page: params.page ?? 1,
+        pageSize: params.pageSize ?? 8,
+        workflows,
+        paneRows: panes.map((pane) => ({
+          id: pane.id,
+          name: pane.name ?? "(unnamed)",
+        })),
+        recommendations,
+        experiments,
+        assignments,
+        healthChecks: checks,
+      });
+
+      return asToolResult({
+        section,
+        page: params.page ?? 1,
+        pageSize: params.pageSize ?? 8,
+        lines,
+      });
+    },
+  });
+
+  pi.registerTool({
+    name: "orchestra_evidence_schema_registry",
+    label: "Orchestra Evidence Schema Registry",
+    description: "List evidence schemas by workflow and state",
+    parameters: Type.Object({ workflow: Type.Optional(Type.String()) }),
+    async execute(_toolCallId, params) {
+      await initialize();
+      const entries = collectEvidenceSchemas(engine.listDefinitions());
+      const filtered = params.workflow
+        ? entries.filter((entry) => entry.workflow === params.workflow)
+        : entries;
+      return asToolResult({ count: filtered.length, entries: filtered });
+    },
+  });
+
+  pi.registerTool({
+    name: "orchestra_evidence_diagnostics",
+    label: "Orchestra Evidence Diagnostics",
+    description: "Show evidence validation diagnostics for a workflow instance",
+    parameters: Type.Object({ workflowId: Type.String() }),
+    async execute(_toolCallId, params) {
+      await initialize();
+      const workflow = engine.get(params.workflowId);
+      if (!workflow) {
+        return asToolResult({ error: "unknown_workflow" });
+      }
+
+      const diagnostics = buildWorkflowEvidenceDiagnostics(workflow);
+      return asToolResult({
+        workflowId: params.workflowId,
+        diagnostics,
+        failing: diagnostics.filter((entry) => !entry.ok).length,
+      });
+    },
+  });
+
+  pi.registerTool({
     name: "orchestra_workflow_detail",
     label: "Orchestra Workflow Detail",
     description: "Get detailed state lines for one workflow",
@@ -422,6 +721,25 @@ export default function (pi: ExtensionAPI): void {
       await initialize();
       const dispatch = await engine.dispatchCurrentState(params.workflowId);
       return asToolResult(dispatch);
+    },
+  });
+
+  pi.registerTool({
+    name: "orchestra_health_status",
+    label: "Orchestra Health Status",
+    description: "Run or retrieve background health checks",
+    parameters: Type.Object({ runNow: Type.Optional(Type.Boolean()) }),
+    async execute(_toolCallId, params) {
+      await initialize();
+      const results = params.runNow
+        ? await scheduler.runOnce()
+        : lastHealthResults;
+      return asToolResult({
+        checks: results,
+        failing: results.filter((result) => !result.ok).length,
+        scheduler: scheduler.getState(),
+        escalation: lastHealthEscalation,
+      });
     },
   });
 
@@ -477,6 +795,8 @@ export default function (pi: ExtensionAPI): void {
         retro,
         retroArtifact,
         projectConfig,
+        scheduler,
+        () => lastHealthResults,
       );
     },
   });
@@ -495,6 +815,67 @@ const parseJsonParams = (raw?: string): Record<string, unknown> => {
   return parsed as Record<string, unknown>;
 };
 
+const parsePaneSpecs = (raw?: string): PaneSpawnSpec[] => {
+  if (!raw) {
+    return [];
+  }
+
+  const parsed = JSON.parse(raw) as unknown;
+  if (!Array.isArray(parsed)) {
+    throw new Error("pane specs must be a JSON array");
+  }
+
+  return parsed.map((item) => {
+    if (typeof item !== "object" || item === null) {
+      throw new Error("pane spec must be an object");
+    }
+
+    const candidate = item as {
+      name?: unknown;
+      cwd?: unknown;
+      command?: unknown;
+    };
+
+    if (typeof candidate.name !== "string" || candidate.name.length === 0) {
+      throw new Error("pane spec name must be a non-empty string");
+    }
+
+    if (typeof candidate.cwd !== "string" || candidate.cwd.length === 0) {
+      throw new Error("pane spec cwd must be a non-empty string");
+    }
+
+    if (
+      !Array.isArray(candidate.command) ||
+      candidate.command.some((entry) => typeof entry !== "string")
+    ) {
+      throw new Error("pane spec command must be an array of strings");
+    }
+
+    return {
+      name: candidate.name,
+      cwd: candidate.cwd,
+      command: candidate.command,
+    };
+  });
+};
+
+const parseDashboardSection = (input?: string): DashboardSection => {
+  const section = input ?? "overview";
+  if (
+    section !== "overview" &&
+    section !== "workflows" &&
+    section !== "tuning" &&
+    section !== "panes" &&
+    section !== "health"
+  ) {
+    throw new Error(
+      "dashboard section must be one of: overview, workflows, tuning, panes, health",
+    );
+  }
+
+  return section;
+};
+
 const handleCommand = async (
   args: string,
   ctx: ExtensionCommandContext,
@@ -504,6 +885,8 @@ const handleCommand = async (
   retro: RetroProposalApplier,
   retroArtifact: RetroProposalArtifact,
   projectConfig: ReturnType<typeof loadProjectConfig>,
+  scheduler: HealthScheduler,
+  getHealthChecks: () => HealthCheckResult[],
 ): Promise<void> => {
   const [command, ...rest] = args.trim().split(/\s+/);
 
@@ -525,6 +908,39 @@ const handleCommand = async (
     return;
   }
 
+  if (command === "dashboard") {
+    try {
+      const section = parseDashboardSection(rest[0]);
+      const page = Number(rest[1] ?? "1");
+      const workflows = engine.list();
+      const panes = await zellij.listPanes();
+      const recommendations = tuner.listRecommendations();
+      const experiments = tuner.listExperiments();
+      const assignments = tuner.listAssignments();
+      const lines = buildInteractiveDashboardLines({
+        section,
+        page: Number.isFinite(page) ? page : 1,
+        pageSize: 8,
+        workflows,
+        paneRows: panes.map((pane) => ({
+          id: pane.id,
+          name: pane.name ?? "(unnamed)",
+        })),
+        recommendations,
+        experiments,
+        assignments,
+        healthChecks: getHealthChecks(),
+      });
+
+      ctx.ui.setWidget("orchestra-dashboard", lines);
+      ctx.ui.notify(`dashboard: ${section}`, "info");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "invalid input";
+      ctx.ui.notify(`dashboard error: ${message}`, "error");
+    }
+    return;
+  }
+
   if (command === "help") {
     ctx.ui.setWidget("orchestra-help", buildCommandHelpLines());
     ctx.ui.notify("orchestra help updated", "info");
@@ -532,14 +948,37 @@ const handleCommand = async (
   }
 
   if (command === "project") {
+    const currentProjectConfig = loadProjectConfig(process.cwd());
     ctx.ui.setWidget("orchestra-project", [
-      `name=${projectConfig.name}`,
-      `flavor=${projectConfig.flavor}`,
-      `autonomy=${projectConfig.autonomyLevel}`,
-      `review_cadence=${projectConfig.humanReviewCadence}`,
-      `team_size=${projectConfig.team.length}`,
+      `name=${currentProjectConfig.name}`,
+      `flavor=${currentProjectConfig.flavor}`,
+      `autonomy=${currentProjectConfig.autonomyLevel}`,
+      `review_cadence=${currentProjectConfig.humanReviewCadence}`,
+      `team_size=${currentProjectConfig.team.length}`,
     ]);
-    ctx.ui.notify(`project: ${projectConfig.name}`, "info");
+    ctx.ui.notify(`project: ${currentProjectConfig.name}`, "info");
+    return;
+  }
+
+  if (command === "project-bootstrap") {
+    const force = rest[0] === "force";
+    const result = bootstrapProjectConfig(process.cwd(), { force });
+    const currentProjectConfig = loadProjectConfig(process.cwd());
+    ctx.ui.setWidget("orchestra-project-bootstrap", [
+      `file=${result.file}`,
+      `created=${result.created}`,
+      `overwritten=${result.overwritten}`,
+      `skipped=${result.skipped}`,
+      ...(result.reason ? [`reason=${result.reason}`] : []),
+      `name=${currentProjectConfig.name}`,
+      `flavor=${currentProjectConfig.flavor}`,
+    ]);
+    ctx.ui.notify(
+      result.skipped
+        ? "project bootstrap skipped (already exists)"
+        : "project bootstrap wrote .orchestra/project.ts",
+      result.skipped ? "warning" : "info",
+    );
     return;
   }
 
@@ -569,6 +1008,66 @@ const handleCommand = async (
     ctx.ui.notify(
       report.ready ? "branch readiness: go" : "branch readiness: no-go",
       report.ready ? "info" : "warning",
+    );
+    return;
+  }
+
+  if (command === "evidence-schema") {
+    const workflowFilter = rest[0];
+    const entries = collectEvidenceSchemas(engine.listDefinitions());
+    const filtered = workflowFilter
+      ? entries.filter((entry) => entry.workflow === workflowFilter)
+      : entries;
+    ctx.ui.notify(`evidence schemas: ${filtered.length}`, "info");
+    ctx.ui.setWidget(
+      "orchestra-evidence-schema",
+      filtered.length > 0
+        ? filtered.map(
+            (entry) =>
+              `${entry.workflow}/${entry.state}: ${
+                Object.entries(entry.schema)
+                  .map(([key, typeName]) => `${key}:${typeName}`)
+                  .join(",") || "(none)"
+              }`,
+          )
+        : ["No evidence schemas found"],
+    );
+    return;
+  }
+
+  if (command === "evidence-diagnostics") {
+    const workflowId = rest[0];
+    if (!workflowId) {
+      ctx.ui.notify(
+        "usage: /orchestra evidence-diagnostics <workflowId>",
+        "error",
+      );
+      return;
+    }
+
+    const workflow = engine.get(workflowId);
+    if (!workflow) {
+      ctx.ui.notify(`unknown workflow: ${workflowId}`, "error");
+      return;
+    }
+
+    const diagnostics = buildWorkflowEvidenceDiagnostics(workflow);
+    ctx.ui.notify(
+      `evidence diagnostics: failing=${diagnostics.filter((entry) => !entry.ok).length}`,
+      diagnostics.some((entry) => !entry.ok) ? "warning" : "info",
+    );
+    ctx.ui.setWidget(
+      "orchestra-evidence-diagnostics",
+      diagnostics.length > 0
+        ? diagnostics.flatMap((entry) =>
+            entry.ok
+              ? [`ok ${entry.state}`]
+              : [
+                  `warn ${entry.state}`,
+                  ...entry.errors.map((error) => `  - ${error}`),
+                ],
+          )
+        : ["No diagnostics available"],
     );
     return;
   }
@@ -626,11 +1125,67 @@ const handleCommand = async (
   if (command === "tuning") {
     const summaries = tuner.summarizeByRolePhase();
     const recommendations = tuner.listRecommendations();
+    const experiments = tuner.listExperiments();
+    const assignments = tuner.listAssignments();
     ctx.ui.notify(
-      `tuning: ${summaries.length} groups, ${recommendations.length} recommendations`,
+      `tuning: ${summaries.length} groups, ${recommendations.length} recommendations, ${experiments.length} experiments`,
       "info",
     );
-    ctx.ui.setWidget("orchestra-tuning", buildTuningLines(recommendations));
+    ctx.ui.setWidget("orchestra-tuning", [
+      ...buildTuningLines(recommendations),
+      `experiments=${experiments.length}`,
+      `pending=${experiments.filter((exp) => exp.status === "pending").length}`,
+      `assignments=${assignments.length}`,
+    ]);
+    return;
+  }
+
+  if (command === "tuning-experiments") {
+    const sub = rest[0] ?? "status";
+    if (sub === "create-from-recommendations") {
+      const created = tuner.createExperimentsFromRecommendations();
+      ctx.ui.notify(`created ${created.length} experiments`, "info");
+      ctx.ui.setWidget(
+        "orchestra-tuning-experiments",
+        created.length > 0
+          ? created.map(
+              (exp) =>
+                `${exp.id}: ${exp.role}/${exp.phase} ${exp.baseline_model} -> ${exp.challenger_model}`,
+            )
+          : ["No experiments created"],
+      );
+      return;
+    }
+
+    if (sub === "run") {
+      const result = tuner.runExperiments();
+      ctx.ui.notify(
+        `completed ${result.completed.length}, pending ${result.pending.length}`,
+        result.pending.length > 0 ? "warning" : "info",
+      );
+      ctx.ui.setWidget("orchestra-tuning-experiments", [
+        `completed=${result.completed.length}`,
+        `pending=${result.pending.length}`,
+        ...result.completed.map(
+          (exp) =>
+            `${exp.id}: ${exp.decision ?? "n/a"} (${exp.rationale ?? ""})`,
+        ),
+      ]);
+      return;
+    }
+
+    const experiments = tuner.listExperiments();
+    const assignments = tuner.listAssignments();
+    ctx.ui.notify(`experiments: ${experiments.length}`, "info");
+    ctx.ui.setWidget("orchestra-tuning-experiments", [
+      `total=${experiments.length}`,
+      `pending=${experiments.filter((exp) => exp.status === "pending").length}`,
+      `assignments=${assignments.length}`,
+      ...assignments.map(
+        (assignment) =>
+          `${assignment.role}/${assignment.phase}: ${assignment.model}`,
+      ),
+    ]);
     return;
   }
 
@@ -643,6 +1198,40 @@ const handleCommand = async (
         ? panes.map((pane) => `${pane.id}: ${pane.name ?? "(unnamed)"}`)
         : ["No zellij panes found"],
     );
+    return;
+  }
+
+  if (command === "pane-recover") {
+    const specsRaw = rest.join(" ").trim();
+    if (!specsRaw) {
+      ctx.ui.notify(
+        "usage: /orchestra pane-recover <jsonArrayOfPaneSpecs>",
+        "error",
+      );
+      return;
+    }
+
+    const specs = parsePaneSpecs(specsRaw);
+    const outcome = await zellij.reconcilePanes(specs);
+    ctx.ui.notify(
+      `pane recovery: spawned=${outcome.spawned.length} missing=${outcome.missing.length}`,
+      outcome.missing.length > 0 ? "warning" : "info",
+    );
+    ctx.ui.setWidget("orchestra-pane-recover", [
+      `pane_count=${outcome.paneCount}`,
+      `present=${outcome.present.length}`,
+      `spawned=${outcome.spawned.length}`,
+      `missing=${outcome.missing.length}`,
+      ...outcome.spawned.map(
+        (entry) => `spawned ${entry.name} -> ${entry.paneId ?? "unknown"}`,
+      ),
+      ...outcome.idChanges.map(
+        (change) => `id-change ${change.name}: ${change.from} -> ${change.to}`,
+      ),
+      ...(outcome.missing.length > 0
+        ? [`missing: ${outcome.missing.join(",")}`]
+        : ["missing: none"]),
+    ]);
     return;
   }
 
@@ -707,6 +1296,30 @@ const handleCommand = async (
     const workflows = engine.list();
     ctx.ui.setWidget("orchestra-actions", buildActionLines(workflows));
     ctx.ui.notify("next actions updated", "info");
+    return;
+  }
+
+  if (command === "health") {
+    const results = await scheduler.runOnce();
+    const failing = results.filter((result) => !result.ok).length;
+    const schedulerState = scheduler.getState();
+    ctx.ui.setWidget("orchestra-health", [
+      `failure_streak=${schedulerState.failureStreak}`,
+      `threshold=${schedulerState.escalationThreshold}`,
+      ...results.map(
+        (result) =>
+          `${result.ok ? "ok" : "warn"} ${result.name}: ${result.message}`,
+      ),
+      ...(schedulerState.escalation
+        ? [`escalated_at=${schedulerState.escalation.at}`]
+        : []),
+    ]);
+    ctx.ui.notify(
+      failing > 0
+        ? `health checks: ${failing} warning(s)`
+        : "health checks: all good",
+      failing > 0 ? "warning" : "info",
+    );
     return;
   }
 

@@ -57,6 +57,7 @@ Required repo secret:
 
 - `/orchestra help`
 - `/orchestra status`
+- `/orchestra dashboard [overview|workflows|tuning|panes|health] [page]`
 - `/orchestra start <workflow> [jsonParams]`
 - `/orchestra workflow <workflowId>`
 - `/orchestra dispatch <workflowId>`
@@ -65,11 +66,17 @@ Required repo secret:
 - `/orchestra panes`
 - `/orchestra pane-focus <paneId|paneName>`
 - `/orchestra pane-close <paneId|paneName>`
+- `/orchestra pane-recover <jsonArrayOfPaneSpecs>`
+- `/orchestra health`
 - `/orchestra tuning`
+- `/orchestra tuning-experiments [status|create-from-recommendations|run]`
 - `/orchestra observe`
 - `/orchestra project`
+- `/orchestra project-bootstrap [force]`
 - `/orchestra cutline`
 - `/orchestra readiness`
+- `/orchestra evidence-schema [workflow]`
+- `/orchestra evidence-diagnostics <workflowId>`
 - `/orchestra actions`
 - `/orchestra retro-show [workflowId]`
 - `/orchestra retro-materialize <workflowId> [apply]`
