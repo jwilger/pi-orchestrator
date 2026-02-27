@@ -27,6 +27,14 @@ describe("ZellijSupervisor", () => {
     const pi = {
       exec: async (bin: string, args: string[]) => {
         calls.push({ bin, args });
+        if (args.includes("dump-layout")) {
+          return {
+            code: 0,
+            stdout: 'pane id="44" name="agent-green"',
+            stderr: "",
+            killed: false,
+          };
+        }
         return { code: 0, stdout: "", stderr: "", killed: false };
       },
     } as unknown as ExtensionAPI;
@@ -39,7 +47,7 @@ describe("ZellijSupervisor", () => {
     });
 
     expect(result.ok).toBe(true);
-    expect(calls).toHaveLength(1);
+    expect(result.paneId).toBe("44");
     expect(calls[0]?.bin).toBe("zellij");
     expect(calls[0]?.args).toContain("new-pane");
     expect(calls[0]?.args).toContain("agent-green");
@@ -61,6 +69,52 @@ describe("ZellijSupervisor", () => {
     expect(panes).toEqual([
       { id: "7", name: "agent-review" },
       { id: "8", name: undefined },
+    ]);
+    expect(supervisor.getTrackedPaneIds()).toEqual({ "agent-review": "7" });
+  });
+
+  it("reconciles missing panes and tracks id changes", async () => {
+    const dumps = [
+      'pane id="1" name="agent-red"',
+      'pane id="1" name="agent-red"\npane id="2" name="agent-green"',
+      'pane id="1" name="agent-red"\npane id="2" name="agent-green"',
+      'pane id="9" name="agent-red"\npane id="2" name="agent-green"',
+      'pane id="9" name="agent-red"\npane id="2" name="agent-green"',
+    ];
+
+    const pi = {
+      exec: async (_bin: string, args: string[]) => {
+        if (args.includes("dump-layout")) {
+          return {
+            code: 0,
+            stdout: dumps.shift() ?? "",
+            stderr: "",
+            killed: false,
+          };
+        }
+
+        return { code: 0, stdout: "", stderr: "", killed: false };
+      },
+    } as unknown as ExtensionAPI;
+
+    const supervisor = new ZellijSupervisor(pi);
+
+    const first = await supervisor.reconcilePanes([
+      { name: "agent-red", cwd: "/tmp", command: ["pi"] },
+      { name: "agent-green", cwd: "/tmp", command: ["pi"] },
+    ]);
+
+    expect(first.present).toHaveLength(1);
+    expect(first.spawned).toHaveLength(1);
+    expect(first.missing).toEqual([]);
+
+    const second = await supervisor.reconcilePanes([
+      { name: "agent-red", cwd: "/tmp", command: ["pi"] },
+      { name: "agent-green", cwd: "/tmp", command: ["pi"] },
+    ]);
+
+    expect(second.idChanges).toEqual([
+      { name: "agent-red", from: "1", to: "9" },
     ]);
   });
 
