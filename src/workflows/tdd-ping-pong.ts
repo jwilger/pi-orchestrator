@@ -1,31 +1,38 @@
 import {
   command,
   defineWorkflow,
-  evidence,
+  subworkflow,
   verdict,
 } from "../core/workflow-definition";
 
+/**
+ * Two-personality TDD ping-pong with mandatory domain review.
+ *
+ * Two people (persona_a, persona_b) alternate turns. Each turn is a
+ * tdd-turn subworkflow where the turn-taker triages the test state
+ * and then does red or green work — all colored by their personality.
+ *
+ * Domain review sits between every turn as a mandatory gateway.
+ * The domain reviewer is always the domain design specialist — their
+ * persona comes from the project config, not the turn.
+ *
+ * Cycle: TURN_A → REVIEW_A → TURN_B → REVIEW_B → TURN_A → ...
+ * until a reviewer submits "complete".
+ */
 export default defineWorkflow({
   name: "tdd-ping-pong",
-  description: "Two-agent TDD cycle with domain review",
-  initialState: "RED",
+  description:
+    "Two-personality TDD cycle with mandatory domain review between turns",
+  initialState: "TURN_A",
   params: {
+    persona_a: { type: "string", required: true },
+    persona_b: { type: "string", required: true },
     scenario: { type: "string", required: true },
     test_runner: { type: "string", default: "npm test" },
     test_dir: { type: "string", default: "tests/" },
     src_dir: { type: "string", default: "src/" },
   },
   roles: {
-    ping: {
-      agent: "tdd-red",
-      tools: ["read", "bash", "edit", "write"],
-      fileScope: { writable: ["tests/**"], readable: ["**"] },
-    },
-    pong: {
-      agent: "tdd-green",
-      tools: ["read", "bash", "edit", "write"],
-      fileScope: { writable: ["src/**"], readable: ["**"] },
-    },
     domain_reviewer: {
       agent: "domain-review",
       tools: ["read", "bash"],
@@ -33,36 +40,55 @@ export default defineWorkflow({
     },
   },
   states: {
-    RED: {
-      assign: "ping",
-      gate: evidence({
-        schema: { test_file: "string", failure_output: "string" },
-        verify: { command: "npm test", expectExitCode: 1 },
-      }),
-      transitions: { pass: "DOMAIN_REVIEW_TEST", fail: "RED" },
-      maxRetries: 3,
-    },
-    DOMAIN_REVIEW_TEST: {
+    // --- Person A's turn ---
+    TURN_A: subworkflow({
+      workflow: "tdd-turn",
+      inputMap: {
+        turn_persona: "params.persona_a",
+        scenario: "params.scenario",
+        test_runner: "params.test_runner",
+        test_dir: "params.test_dir",
+        src_dir: "params.src_dir",
+      },
+      transitions: { success: "REVIEW_A", failure: "ESCALATE" },
+    }),
+
+    REVIEW_A: {
       assign: "domain_reviewer",
-      gate: verdict({ options: ["approved", "flagged"] }),
-      transitions: { approved: "GREEN", flagged: "RED" },
+      gate: verdict({ options: ["continue", "flagged", "complete"] }),
+      transitions: {
+        continue: "TURN_B",
+        flagged: "TURN_A",
+        complete: "COMMIT",
+      },
       maxRetries: 2,
     },
-    GREEN: {
-      assign: "pong",
-      gate: evidence({
-        schema: { implementation_files: "string[]", test_output: "string" },
-        verify: { command: "npm test", expectExitCode: 0 },
-      }),
-      transitions: { pass: "DOMAIN_REVIEW_IMPL", fail: "GREEN" },
-      maxRetries: 3,
-    },
-    DOMAIN_REVIEW_IMPL: {
+
+    // --- Person B's turn ---
+    TURN_B: subworkflow({
+      workflow: "tdd-turn",
+      inputMap: {
+        turn_persona: "params.persona_b",
+        scenario: "params.scenario",
+        test_runner: "params.test_runner",
+        test_dir: "params.test_dir",
+        src_dir: "params.src_dir",
+      },
+      transitions: { success: "REVIEW_B", failure: "ESCALATE" },
+    }),
+
+    REVIEW_B: {
       assign: "domain_reviewer",
-      gate: verdict({ options: ["approved", "flagged"] }),
-      transitions: { approved: "COMMIT", flagged: "GREEN" },
+      gate: verdict({ options: ["continue", "flagged", "complete"] }),
+      transitions: {
+        continue: "TURN_A",
+        flagged: "TURN_B",
+        complete: "COMMIT",
+      },
       maxRetries: 2,
     },
+
+    // --- Wrap up ---
     COMMIT: {
       type: "action",
       commands: ["git add -A", "git commit -m 'TDD cycle complete'"],

@@ -4,11 +4,28 @@ import path from "node:path";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { describe, expect, it } from "vitest";
 import { StateStore } from "../src/core/state-store";
+import type {
+  AgentState,
+  WorkflowDefinition,
+  WorkflowRuntimeState,
+} from "../src/core/types";
+import { asWorkflowId, asWorkflowType } from "../src/core/types";
 import {
+  type BuildAgentPromptInput,
+  type BuildAgentTaskInput,
   WorkflowEngine,
+  applyRoleOverrides,
+  buildAgentPrompt,
+  buildAgentTask,
   buildScopeExtension,
+  resolveAgentDefinition,
+  resolveInputMap,
+  resolvePersonaForDispatch,
+  resolvePersonaFromParams,
+  resolveWorkflowSlot,
   shellEscape,
 } from "../src/core/workflow-engine";
+import type { ProjectConfig } from "../src/project/config";
 
 type ExecResult = {
   code: number;
@@ -625,13 +642,21 @@ describe("WorkflowEngine", () => {
     const firstDispatch = await engine.dispatchCurrentState(state.workflow_id);
     expect(firstDispatch.dispatched).toBe(true);
     expect(firstDispatch.details).toContain(`${state.workflow_id}-worker`);
-    expect(commands.some((cmd) => cmd.includes("zellij action new-pane"))).toBe(
+    expect(commands.some((cmd) => cmd.includes("zellij action new-tab"))).toBe(
       true,
     );
     expect(calls.at(-1)?.bin).toBe("bash");
     expect(calls.at(-1)?.args[0]).toBe("-lc");
     expect(calls.at(-1)?.args[1]).toContain("--tools read,bash");
     expect(calls.at(-1)?.args[1]).toContain("--append-system-prompt");
+    // Should NOT use headless flags — agents are interactive TUI sessions
+    expect(calls.at(-1)?.args[1]).not.toContain("--mode json");
+    expect(calls.at(-1)?.args[1]).not.toContain("--no-session");
+    expect(calls.at(-1)?.args[1]).not.toContain("--close-on-exit");
+    expect(calls.at(-1)?.args[1]).not.toContain("-p ");
+    // Should use @file syntax for initial task and --session-dir for persistence
+    expect(calls.at(-1)?.args[1]).toContain("@");
+    expect(calls.at(-1)?.args[1]).toContain("--session-dir");
 
     const runtimeDir = path.join(
       cwd,
@@ -651,12 +676,16 @@ describe("WorkflowEngine", () => {
     expect(scope).toContain(`const AGENT_ID = "${state.workflow_id}-worker"`);
     expect(scope).toContain(`const WORKFLOW_ID = "${state.workflow_id}"`);
     expect(scope).toContain('const WRITABLE = ["src/**"]');
-    expect(prompt).toContain("# Role worker");
-    expect(prompt).toContain(`Workflow: ${state.workflow_id}`);
-    expect(prompt).toContain("State: WORK");
+    expect(prompt).toContain("# Role: worker");
+    expect(prompt).toContain(`Workflow ID: ${state.workflow_id}`);
+    expect(prompt).toContain("Current state: WORK");
+    expect(prompt).toContain("submit_evidence");
+    expect(prompt).toContain("send_message");
+    expect(prompt).toContain("check_inbox");
     expect(task).toContain(
       `Execute state WORK for workflow ${state.workflow_id}`,
     );
+    expect(task).toContain("Gate kind: verdict");
 
     await engine.submitEvidence(state.workflow_id, {
       state: "WORK",
@@ -1050,6 +1079,55 @@ describe("WorkflowEngine", () => {
   });
 });
 
+describe("WorkflowEngine.setProjectConfig", () => {
+  it("stores project config for later dispatch use", async () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "orch-cfg-"));
+    writeWorkflow(
+      path.join(cwd, "src", "workflows"),
+      "simple",
+      `export default {
+        name: "simple",
+        description: "simple",
+        initialState: "WORK",
+        roles: { r: { agent: "a", tools: ["read"], fileScope: { writable: [], readable: ["**"] } } },
+        states: {
+          WORK: { assign: "r", gate: { kind: "evidence", schema: { x: "string" } }, transitions: { pass: "DONE" } },
+          DONE: { type: "terminal", result: "success" }
+        }
+      }`,
+    );
+    const { pi } = createFakePi();
+    const store = new StateStore(path.join(cwd, ".orchestra"));
+    store.ensure();
+    const engine = new WorkflowEngine(pi, cwd, store);
+    await engine.loadWorkflows();
+
+    const config: ProjectConfig = {
+      name: "test",
+      flavor: "event-modeled",
+      testRunner: "bun test",
+      buildCommand: "bun run build",
+      lintCommand: "bun run lint",
+      formatCheck: "bun run fmt",
+      mutationTool: "stryker",
+      ciProvider: "github-actions",
+      testDir: "tests/**",
+      srcDir: "src/**",
+      typeDir: "src/**",
+      reworkBudget: 3,
+      autonomyLevel: "full",
+      humanReviewCadence: "end",
+      team: [],
+      roles: {},
+    };
+    engine.setProjectConfig(config);
+
+    // The engine should use the config when dispatching
+    const state = engine.start("simple", {});
+    expect(state.current_state).toBe("WORK");
+  });
+});
+
 describe("workflow-engine helpers", () => {
   it("shellEscape escapes single quotes", () => {
     expect(shellEscape("ab'cd")).toBe("ab'\\''cd");
@@ -1069,5 +1147,2099 @@ describe("workflow-engine helpers", () => {
     expect(source).toContain('name: "check_inbox"');
     expect(source).toContain('name: "submit_evidence"');
     expect(source).toContain("socketPath: SOCKET_PATH");
+  });
+});
+
+// --- Test fixtures for buildAgentPrompt / buildAgentTask ---
+
+const makePromptInput = (
+  overrides: Partial<BuildAgentPromptInput> = {},
+): BuildAgentPromptInput => {
+  const cwd = os.tmpdir();
+  return {
+    role: "test_role",
+    roleDefinition: {
+      agent: "tdd-red",
+      tools: ["read", "bash"],
+      fileScope: { writable: ["tests/**"], readable: ["**"] },
+    },
+    workflowId: "wf-123",
+    workflowDefinition: {
+      name: "test-workflow",
+      description: "A test workflow",
+      roles: {},
+      states: {},
+    },
+    state: "RED",
+    stateDefinition: {
+      assign: "test_role",
+      gate: {
+        kind: "evidence",
+        schema: { test_file: "string", failure_output: "string" },
+      },
+      transitions: { pass: "GREEN", fail: "RED" },
+    },
+    cwd,
+    ...overrides,
+  };
+};
+
+const makeTaskInput = (
+  overrides: Partial<BuildAgentTaskInput> = {},
+): BuildAgentTaskInput => ({
+  workflowId: "wf-123",
+  state: "RED",
+  stateDefinition: {
+    assign: "test_role",
+    gate: {
+      kind: "evidence",
+      schema: { test_file: "string", failure_output: "string" },
+    },
+    transitions: { pass: "GREEN", fail: "RED" },
+  },
+  runtimeState: {
+    workflow_id: asWorkflowId("wf-123"),
+    workflow_type: asWorkflowType("test-workflow"),
+    current_state: "RED",
+    retry_count: 0,
+    paused: false,
+    params: {},
+    evidence: {},
+    metrics: {},
+    history: [{ state: "RED", entered_at: "2026-01-01T00:00:00Z", retries: 0 }],
+    created_at: "2026-01-01T00:00:00Z",
+    updated_at: "2026-01-01T00:00:00Z",
+  },
+  ...overrides,
+});
+
+describe("buildAgentPrompt", () => {
+  it("includes role, workflow context, gate schema, and tool instructions", () => {
+    const prompt = buildAgentPrompt(makePromptInput());
+
+    expect(prompt).toContain("# Role: test_role");
+    expect(prompt).toContain("Workflow ID: wf-123");
+    expect(prompt).toContain("Current state: RED");
+    expect(prompt).toContain("test-workflow — A test workflow");
+    expect(prompt).toContain("Gate kind: evidence");
+    expect(prompt).toContain("test_file: string");
+    expect(prompt).toContain("failure_output: string");
+    expect(prompt).toContain("### submit_evidence");
+    expect(prompt).toContain("### send_message");
+    expect(prompt).toContain("### check_inbox");
+    expect(prompt).toContain("Writable: tests/**");
+    expect(prompt).toContain("Readable: **");
+  });
+
+  it("includes persona content when roleDefinition.persona is set", () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "prompt-test-"));
+    const personaDir = path.join(cwd, ".team");
+    fs.mkdirSync(personaDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(personaDir, "expert.md"),
+      "# Expert TDD Specialist\n\nI am a TDD expert with 20 years of experience.",
+      "utf8",
+    );
+
+    const prompt = buildAgentPrompt(
+      makePromptInput({
+        cwd,
+        roleDefinition: {
+          agent: "tdd-red",
+          persona: ".team/expert.md",
+          tools: ["read"],
+          fileScope: { writable: [], readable: ["**"] },
+        },
+      }),
+    );
+
+    expect(prompt).toContain("## Persona");
+    expect(prompt).toContain("Expert TDD Specialist");
+    expect(prompt).toContain("20 years of experience");
+  });
+
+  it("skips persona section when persona file does not exist", () => {
+    const prompt = buildAgentPrompt(
+      makePromptInput({
+        cwd: os.tmpdir(),
+        roleDefinition: {
+          agent: "tdd-red",
+          persona: ".team/nonexistent.md",
+          tools: ["read"],
+          fileScope: { writable: [], readable: ["**"] },
+        },
+      }),
+    );
+
+    expect(prompt).not.toContain("## Persona");
+  });
+
+  it("includes agent definition content from built-in agents", () => {
+    // Use the actual project cwd so built-in agents can be resolved
+    const projectCwd = path.join(process.cwd());
+    const prompt = buildAgentPrompt(
+      makePromptInput({
+        cwd: projectCwd,
+        roleDefinition: {
+          agent: "tdd-red",
+          tools: ["read", "bash"],
+          fileScope: { writable: ["tests/**"], readable: ["**"] },
+        },
+      }),
+    );
+
+    expect(prompt).toContain("## Agent Definition (tdd-red)");
+    expect(prompt).toContain("RED-phase TDD specialist");
+  });
+
+  it("prefers project override agent definition over built-in", () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "prompt-test-"));
+    const agentsDir = path.join(cwd, ".orchestra", "agents.d");
+    fs.mkdirSync(agentsDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(agentsDir, "custom-agent.md"),
+      "# Custom Agent\n\nProject-specific agent behavior.",
+      "utf8",
+    );
+
+    const prompt = buildAgentPrompt(
+      makePromptInput({
+        cwd,
+        roleDefinition: {
+          agent: "custom-agent",
+          tools: ["read"],
+          fileScope: { writable: [], readable: ["**"] },
+        },
+      }),
+    );
+
+    expect(prompt).toContain("## Agent Definition (custom-agent)");
+    expect(prompt).toContain("Project-specific agent behavior");
+  });
+
+  it("includes project context when projectConfig is provided", () => {
+    const prompt = buildAgentPrompt(
+      makePromptInput({
+        projectConfig: {
+          name: "my-app",
+          flavor: "event-modeled",
+          testRunner: "bun test",
+          buildCommand: "bun run build",
+          lintCommand: "bun run lint",
+          formatCheck: "bun run lint",
+          mutationTool: "stryker",
+          ciProvider: "github-actions",
+          testDir: "tests/**",
+          srcDir: "src/**",
+          typeDir: "src/**",
+          team: [],
+          autonomyLevel: "full",
+          humanReviewCadence: "end",
+          reworkBudget: 5,
+        },
+      }),
+    );
+
+    expect(prompt).toContain("## Project Context");
+    expect(prompt).toContain("Project: my-app");
+    expect(prompt).toContain("Flavor: event-modeled");
+    expect(prompt).toContain("Test runner: bun test");
+  });
+
+  it("omits project context when projectConfig is not provided", () => {
+    const prompt = buildAgentPrompt(
+      makePromptInput({ projectConfig: undefined }),
+    );
+    expect(prompt).not.toContain("## Project Context");
+  });
+
+  it("shows read-only note when writable is empty", () => {
+    const prompt = buildAgentPrompt(
+      makePromptInput({
+        roleDefinition: {
+          agent: "reviewer",
+          tools: ["read"],
+          fileScope: { writable: [], readable: ["**"] },
+        },
+      }),
+    );
+
+    expect(prompt).toContain("read-only role");
+  });
+
+  it("describes command gate in workflow context", () => {
+    const prompt = buildAgentPrompt(
+      makePromptInput({
+        state: "CHECK",
+        stateDefinition: {
+          assign: "r",
+          gate: { kind: "command", verify: { command: "make test" } },
+          transitions: { pass: "DONE" },
+        },
+      }),
+    );
+    expect(prompt).toContain("Gate kind: command");
+    expect(prompt).toContain("make test");
+  });
+
+  it("describes evidence gate with field names", () => {
+    const prompt = buildAgentPrompt(
+      makePromptInput({
+        stateDefinition: {
+          assign: "r",
+          gate: {
+            kind: "evidence",
+            schema: { branch: "string", count: "number" },
+          },
+          transitions: { pass: "NEXT" },
+        },
+      }),
+    );
+    expect(prompt).toContain("Gate kind: evidence");
+    expect(prompt).toContain("branch: string");
+    expect(prompt).toContain("count: number");
+    // Tool instructions reference the fields
+    expect(prompt).toContain("branch, count");
+  });
+
+  it("describes verdict gate in tool instructions", () => {
+    const prompt = buildAgentPrompt(
+      makePromptInput({
+        state: "REVIEW",
+        stateDefinition: {
+          assign: "reviewer",
+          gate: { kind: "verdict", options: ["approved", "flagged"] },
+          transitions: { approved: "DONE", flagged: "RED" },
+        },
+      }),
+    );
+
+    expect(prompt).toContain("Gate kind: verdict");
+    expect(prompt).toContain("approved, flagged");
+    expect(prompt).toContain("One of: approved, flagged");
+  });
+});
+
+describe("buildAgentTask", () => {
+  it("includes state-specific instructions for RED state", () => {
+    const task = buildAgentTask(makeTaskInput());
+
+    expect(task).toContain("Execute state RED for workflow wf-123");
+    expect(task).toContain("RED phase of TDD");
+    expect(task).toContain("failing test");
+    expect(task).toContain("`npm test`");
+    // Discriminate from GREEN
+    expect(task).not.toContain("GREEN phase");
+    expect(task).not.toContain("minimal production code");
+  });
+
+  it("includes state-specific instructions for RED_ prefixed state", () => {
+    const task = buildAgentTask(
+      makeTaskInput({
+        state: "RED_UNIT",
+        stateDefinition: {
+          assign: "red",
+          gate: {
+            kind: "evidence",
+            schema: { test_file: "string", failure_output: "string" },
+          },
+          transitions: { pass: "DONE" },
+        },
+      }),
+    );
+    expect(task).toContain("RED phase of TDD");
+  });
+
+  it("includes state-specific instructions for GREEN state", () => {
+    const task = buildAgentTask(
+      makeTaskInput({
+        state: "GREEN",
+        stateDefinition: {
+          assign: "pong",
+          gate: {
+            kind: "evidence",
+            schema: { implementation_files: "string[]", test_output: "string" },
+          },
+          transitions: { pass: "REVIEW", fail: "GREEN" },
+        },
+      }),
+    );
+
+    expect(task).toContain("GREEN phase of TDD");
+    expect(task).toContain("minimal production code");
+    expect(task).toContain("`npm test`");
+    // Discriminate from RED
+    expect(task).not.toContain("RED phase of TDD");
+    expect(task).not.toContain("Write a failing test");
+  });
+
+  it("includes state-specific instructions for GREEN_ prefixed state", () => {
+    const task = buildAgentTask(
+      makeTaskInput({
+        state: "GREEN_IMPL",
+        stateDefinition: {
+          assign: "green",
+          gate: {
+            kind: "evidence",
+            schema: { impl: "string" },
+          },
+          transitions: { pass: "DONE" },
+        },
+      }),
+    );
+    expect(task).toContain("GREEN phase of TDD");
+  });
+
+  it("includes state-specific instructions for REFACTOR state", () => {
+    const task = buildAgentTask(
+      makeTaskInput({
+        state: "REFACTOR",
+        stateDefinition: {
+          assign: "r",
+          gate: { kind: "evidence", schema: { files: "string[]" } },
+          transitions: { pass: "DONE" },
+        },
+      }),
+    );
+    expect(task).toContain("REFACTOR phase");
+    expect(task).toContain("without changing behavior");
+    expect(task).not.toContain("RED phase");
+    expect(task).not.toContain("GREEN phase");
+  });
+
+  it("includes state-specific instructions for REFACTOR_ prefixed state", () => {
+    const task = buildAgentTask(
+      makeTaskInput({
+        state: "REFACTOR_TYPES",
+        stateDefinition: {
+          assign: "r",
+          gate: { kind: "evidence", schema: { files: "string[]" } },
+          transitions: { pass: "DONE" },
+        },
+      }),
+    );
+    expect(task).toContain("REFACTOR phase");
+  });
+
+  it("includes state-specific instructions for PIPELINE state", () => {
+    const task = buildAgentTask(
+      makeTaskInput({
+        state: "PIPELINE",
+        stateDefinition: {
+          assign: "p",
+          gate: { kind: "verdict", options: ["complete", "retry"] },
+          transitions: { complete: "DONE", retry: "PIPELINE" },
+        },
+      }),
+    );
+    expect(task).toContain("pipeline agent");
+    expect(task).toContain("acceptance criteria");
+  });
+
+  it("includes state-specific instructions for TDD_CYCLE state", () => {
+    const task = buildAgentTask(
+      makeTaskInput({
+        state: "TDD_CYCLE",
+        stateDefinition: {
+          assign: "pipeline_agent",
+          gate: { kind: "verdict", options: ["complete", "retry"] },
+          transitions: { complete: "REVIEW", retry: "TDD_CYCLE" },
+        },
+      }),
+    );
+
+    expect(task).toContain("pipeline agent coordinating TDD cycles");
+    expect(task).toContain("acceptance criteria");
+  });
+
+  it("includes state-specific instructions for REVIEW states", () => {
+    const task = buildAgentTask(
+      makeTaskInput({
+        state: "DOMAIN_REVIEW",
+        stateDefinition: {
+          assign: "reviewer",
+          gate: { kind: "verdict", options: ["approved", "flagged"] },
+          transitions: { approved: "DONE", flagged: "RED" },
+        },
+      }),
+    );
+
+    expect(task).toContain("Review the code changes");
+    expect(task).toContain("approved' or 'flagged'");
+  });
+
+  it("includes state-specific instructions for REVIEW with non-verdict gate", () => {
+    const task = buildAgentTask(
+      makeTaskInput({
+        state: "REVIEW",
+        stateDefinition: {
+          assign: "reviewer",
+          gate: { kind: "evidence", schema: { summary: "string" } },
+          transitions: { pass: "DONE" },
+        },
+      }),
+    );
+    expect(task).toContain(
+      "Review the code changes and submit your assessment",
+    );
+  });
+
+  it("includes SETUP instructions", () => {
+    const task = buildAgentTask(
+      makeTaskInput({
+        state: "SETUP",
+        stateDefinition: {
+          assign: "r",
+          gate: { kind: "evidence", schema: { branch: "string" } },
+          transitions: { pass: "NEXT" },
+        },
+      }),
+    );
+    expect(task).toContain("Set up the workspace");
+    expect(task).toContain("initial evidence");
+  });
+
+  it("provides fallback for verdict gate on unknown state", () => {
+    const task = buildAgentTask(
+      makeTaskInput({
+        state: "CUSTOM_VERDICT",
+        stateDefinition: {
+          assign: "r",
+          gate: { kind: "verdict", options: ["yes", "no"] },
+          transitions: { yes: "DONE", no: "FAIL" },
+        },
+      }),
+    );
+    expect(task).toContain("Evaluate the current state");
+    expect(task).toContain("yes or no");
+  });
+
+  it("provides fallback for command gate on unknown state", () => {
+    const task = buildAgentTask(
+      makeTaskInput({
+        state: "CUSTOM_CMD",
+        stateDefinition: {
+          assign: "r",
+          gate: { kind: "command", verify: { command: "make test" } },
+          transitions: { pass: "DONE" },
+        },
+      }),
+    );
+    expect(task).toContain("Complete the work for state CUSTOM_CMD");
+    expect(task).toContain("verification command passes");
+  });
+
+  it("includes evidence from prior states", () => {
+    const task = buildAgentTask(
+      makeTaskInput({
+        state: "GREEN",
+        stateDefinition: {
+          assign: "pong",
+          gate: {
+            kind: "evidence",
+            schema: { implementation_files: "string[]", test_output: "string" },
+          },
+          transitions: { pass: "REVIEW", fail: "GREEN" },
+        },
+        runtimeState: {
+          workflow_id: asWorkflowId("wf-123"),
+          workflow_type: asWorkflowType("tdd-ping-pong"),
+          current_state: "GREEN",
+          retry_count: 0,
+          paused: false,
+          params: { scenario: "user login" },
+          evidence: {
+            RED: {
+              test_file: "tests/login.test.ts",
+              failure_output: "FAIL: expected login to succeed",
+              verified: true,
+            },
+          },
+          metrics: {},
+          history: [
+            {
+              state: "RED",
+              entered_at: "2026-01-01T00:00:00Z",
+              retries: 0,
+              exited_at: "2026-01-01T00:01:00Z",
+              result: "pass",
+            },
+            { state: "GREEN", entered_at: "2026-01-01T00:01:00Z", retries: 0 },
+          ],
+          created_at: "2026-01-01T00:00:00Z",
+          updated_at: "2026-01-01T00:01:00Z",
+        },
+      }),
+    );
+
+    expect(task).toContain("## Evidence from Prior States");
+    expect(task).toContain("### RED");
+    expect(task).toContain("tests/login.test.ts");
+    expect(task).toContain("FAIL: expected login to succeed");
+  });
+
+  it("includes gate schema with example for evidence gates", () => {
+    const task = buildAgentTask(makeTaskInput());
+
+    expect(task).toContain("## Gate Schema");
+    expect(task).toContain("Gate kind: evidence");
+    expect(task).toContain("test_file: string");
+    expect(task).toContain("Example submit_evidence call");
+    expect(task).toContain('"state": "RED"');
+    expect(task).toContain('"result": "pass"');
+  });
+
+  it("includes gate schema with example for verdict gates", () => {
+    const task = buildAgentTask(
+      makeTaskInput({
+        state: "REVIEW",
+        stateDefinition: {
+          assign: "reviewer",
+          gate: { kind: "verdict", options: ["approved", "flagged"] },
+          transitions: { approved: "DONE", flagged: "RED" },
+        },
+      }),
+    );
+
+    expect(task).toContain("Gate kind: verdict");
+    expect(task).toContain("approved, flagged");
+    expect(task).toContain('"result": "approved"');
+    expect(task).toContain('"rationale"');
+  });
+
+  it("includes retry context when retry_count > 0", () => {
+    const task = buildAgentTask(
+      makeTaskInput({
+        runtimeState: {
+          workflow_id: asWorkflowId("wf-123"),
+          workflow_type: asWorkflowType("test-workflow"),
+          current_state: "RED",
+          retry_count: 2,
+          paused: false,
+          params: {},
+          evidence: {},
+          metrics: {},
+          history: [
+            {
+              state: "RED",
+              entered_at: "2026-01-01T00:00:00Z",
+              retries: 2,
+              last_failure: "Gate verification failed for RED",
+            },
+          ],
+          created_at: "2026-01-01T00:00:00Z",
+          updated_at: "2026-01-01T00:00:00Z",
+        },
+      }),
+    );
+
+    expect(task).toContain("## Retry Context");
+    expect(task).toContain("retry #2");
+    expect(task).toContain("Gate verification failed for RED");
+    expect(task).toContain("address the failure reason");
+  });
+
+  it("omits retry context when retry_count is 0", () => {
+    const task = buildAgentTask(makeTaskInput());
+    expect(task).not.toContain("## Retry Context");
+  });
+
+  it("includes workflow parameters when present", () => {
+    const task = buildAgentTask(
+      makeTaskInput({
+        runtimeState: {
+          workflow_id: asWorkflowId("wf-123"),
+          workflow_type: asWorkflowType("tdd-ping-pong"),
+          current_state: "RED",
+          retry_count: 0,
+          paused: false,
+          params: { scenario: "user login", test_runner: "bun test" },
+          evidence: {},
+          metrics: {},
+          history: [
+            { state: "RED", entered_at: "2026-01-01T00:00:00Z", retries: 0 },
+          ],
+          created_at: "2026-01-01T00:00:00Z",
+          updated_at: "2026-01-01T00:00:00Z",
+        },
+      }),
+    );
+
+    expect(task).toContain("## Workflow Parameters");
+    expect(task).toContain('scenario: "user login"');
+    expect(task).toContain('test_runner: "bun test"');
+  });
+
+  it("uses testRunner from projectConfig in state instructions", () => {
+    const task = buildAgentTask(
+      makeTaskInput({
+        projectConfig: {
+          name: "my-app",
+          flavor: "event-modeled",
+          testRunner: "bun test",
+          buildCommand: "bun run build",
+          lintCommand: "bun run lint",
+          formatCheck: "bun run lint",
+          mutationTool: "stryker",
+          ciProvider: "github-actions",
+          testDir: "tests/**",
+          srcDir: "src/**",
+          typeDir: "src/**",
+          team: [],
+          autonomyLevel: "full",
+          humanReviewCadence: "end",
+          reworkBudget: 5,
+        },
+      }),
+    );
+
+    expect(task).toContain("`bun test`");
+  });
+
+  it("provides generic instructions for unknown state names", () => {
+    const task = buildAgentTask(
+      makeTaskInput({
+        state: "CUSTOM_PHASE",
+        stateDefinition: {
+          assign: "r",
+          gate: {
+            kind: "evidence",
+            schema: { output: "string" },
+          },
+          transitions: { pass: "DONE" },
+        },
+      }),
+    );
+
+    expect(task).toContain("Complete the work for state CUSTOM_PHASE");
+  });
+
+  it("uses 'pass' as default result in evidence example", () => {
+    const task = buildAgentTask(makeTaskInput());
+    expect(task).toContain('"result": "pass"');
+    expect(task).toContain(`"state": "RED"`);
+  });
+
+  it("uses first verdict option as default in verdict example", () => {
+    const task = buildAgentTask(
+      makeTaskInput({
+        state: "REVIEW",
+        stateDefinition: {
+          assign: "r",
+          gate: { kind: "verdict", options: ["pass_it", "fail_it"] },
+          transitions: { pass_it: "DONE", fail_it: "BACK" },
+        },
+      }),
+    );
+    expect(task).toContain('"result": "pass_it"');
+    expect(task).toContain(`"state": "REVIEW"`);
+  });
+
+  it("fallback retry message when history has no last_failure", () => {
+    const task = buildAgentTask(
+      makeTaskInput({
+        runtimeState: {
+          workflow_id: asWorkflowId("wf-retry"),
+          workflow_type: asWorkflowType("test-workflow"),
+          current_state: "RED",
+          retry_count: 1,
+          paused: false,
+          params: {},
+          evidence: {},
+          metrics: {},
+          history: [
+            { state: "RED", entered_at: "2026-01-01T00:00:00Z", retries: 1 },
+          ],
+          created_at: "2026-01-01T00:00:00Z",
+          updated_at: "2026-01-01T00:00:00Z",
+        },
+      }),
+    );
+    expect(task).toContain("retry #1");
+    expect(task).toContain("Previous attempt failed gate verification");
+  });
+
+  it("omits workflow params when empty", () => {
+    const task = buildAgentTask(makeTaskInput());
+    expect(task).not.toContain("## Workflow Parameters");
+  });
+
+  it("omits prior evidence section when evidence is empty", () => {
+    const task = buildAgentTask(makeTaskInput());
+    expect(task).not.toContain("## Evidence from Prior States");
+  });
+
+  it("prompt tool instructions mention state name in result parameter", () => {
+    const prompt = buildAgentPrompt(
+      makePromptInput({
+        state: "IMPL",
+        stateDefinition: {
+          assign: "r",
+          gate: {
+            kind: "evidence",
+            schema: { out: "string" },
+          },
+          transitions: { pass: "DONE" },
+        },
+      }),
+    );
+    expect(prompt).toContain(`"IMPL"`);
+    expect(prompt).toContain("out");
+  });
+
+  it("prompt shows current state name", () => {
+    const prompt = buildAgentPrompt(
+      makePromptInput({
+        state: "VERIFY",
+      }),
+    );
+    expect(prompt).toContain("Current state: VERIFY");
+  });
+
+  it("prompt shows role name correctly", () => {
+    const prompt = buildAgentPrompt(
+      makePromptInput({
+        role: "custom_role",
+      }),
+    );
+    expect(prompt).toContain("# Role: custom_role");
+    expect(prompt).toContain("Your role: custom_role");
+  });
+
+  it("prompt shows workflow name and description", () => {
+    const prompt = buildAgentPrompt(
+      makePromptInput({
+        workflowDefinition: {
+          name: "my-workflow",
+          description: "Does important things",
+          initialState: "START",
+          roles: {},
+          states: {},
+        },
+      }),
+    );
+    expect(prompt).toContain("my-workflow — Does important things");
+  });
+
+  it("prompt shows build command in project context", () => {
+    const prompt = buildAgentPrompt(
+      makePromptInput({
+        projectConfig: {
+          name: "test-proj",
+          flavor: "traditional-prd",
+          testRunner: "jest",
+          buildCommand: "make build",
+          lintCommand: "eslint",
+          formatCheck: "prettier",
+          mutationTool: "stryker",
+          ciProvider: "github-actions",
+          testDir: "test/**",
+          srcDir: "lib/**",
+          typeDir: "lib/**",
+          team: [],
+          autonomyLevel: "assisted",
+          humanReviewCadence: "every-slice",
+          reworkBudget: 3,
+        },
+      }),
+    );
+    expect(prompt).toContain("Build command: make build");
+    expect(prompt).toContain("Autonomy level: assisted");
+    expect(prompt).toContain("Source directory: lib/**");
+    expect(prompt).toContain("Test directory: test/**");
+  });
+
+  it("prompt file scope lists multiple writable patterns", () => {
+    const prompt = buildAgentPrompt(
+      makePromptInput({
+        roleDefinition: {
+          agent: "dev",
+          tools: ["read", "bash"],
+          fileScope: {
+            writable: ["src/**", "tests/**"],
+            readable: ["docs/**", "config/**"],
+          },
+        },
+      }),
+    );
+    expect(prompt).toContain("Writable: src/**, tests/**");
+    expect(prompt).toContain("Readable: docs/**, config/**");
+  });
+
+  it("prompt always reminds agent to submit evidence", () => {
+    const prompt = buildAgentPrompt(makePromptInput());
+    expect(prompt).toContain(
+      "Always call `submit_evidence` when your work is complete",
+    );
+    expect(prompt).toContain("workflow cannot advance otherwise");
+  });
+});
+
+describe("resolveAgentDefinition", () => {
+  it("returns built-in agent definition", () => {
+    const content = resolveAgentDefinition("tdd-red", process.cwd());
+    expect(content).not.toBeNull();
+    expect(content).toContain("RED-phase TDD specialist");
+  });
+
+  it("prefers project override over built-in", () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "resolve-test-"));
+    const agentsDir = path.join(cwd, ".orchestra", "agents.d");
+    fs.mkdirSync(agentsDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(agentsDir, "tdd-red.md"),
+      "# Custom Red Agent\n\nOverridden behavior.",
+      "utf8",
+    );
+
+    const content = resolveAgentDefinition("tdd-red", cwd);
+    expect(content).toContain("Custom Red Agent");
+    expect(content).toContain("Overridden behavior");
+  });
+
+  it("returns null for unknown agent", () => {
+    const content = resolveAgentDefinition("nonexistent-agent", os.tmpdir());
+    expect(content).toBeNull();
+  });
+});
+
+describe("resolvePersonaForDispatch", () => {
+  const baseRole = {
+    agent: "tdd-red",
+    tools: ["read", "bash"],
+    fileScope: { writable: ["tests/**"], readable: ["**"] },
+  };
+
+  // Mirrors tdd-ping-pong: ping→RED, domain_reviewer→DOMAIN_REVIEW, pong→GREEN
+  const workflowDef: WorkflowDefinition = {
+    name: "tdd-ping-pong",
+    description: "test workflow",
+    roles: {
+      ping: { ...baseRole, agent: "tdd-red" },
+      pong: { ...baseRole, agent: "tdd-green" },
+      domain_reviewer: { ...baseRole, agent: "domain-review" },
+    },
+    states: {
+      RED: {
+        assign: "ping",
+        gate: { kind: "evidence", schema: { out: "string" } },
+        transitions: { pass: "DOMAIN_REVIEW_TEST" },
+      },
+      DOMAIN_REVIEW_TEST: {
+        assign: "domain_reviewer",
+        gate: { kind: "verdict", options: ["approved", "flagged"] },
+        transitions: { approved: "GREEN", flagged: "RED" },
+      },
+      GREEN: {
+        assign: "pong",
+        gate: { kind: "evidence", schema: { out: "string" } },
+        transitions: { pass: "DOMAIN_REVIEW_IMPL" },
+      },
+      DOMAIN_REVIEW_IMPL: {
+        assign: "domain_reviewer",
+        gate: { kind: "verdict", options: ["approved", "flagged"] },
+        transitions: { approved: "DONE", flagged: "GREEN" },
+      },
+      DONE: { type: "terminal" as const, result: "success" as const },
+    },
+  };
+
+  const makeRuntime = (
+    historyStates: string[],
+    currentState: string,
+  ): WorkflowRuntimeState => ({
+    workflow_id: asWorkflowId("wf-rot"),
+    workflow_type: asWorkflowType("tdd-ping-pong"),
+    current_state: currentState,
+    retry_count: 0,
+    paused: false,
+    params: {},
+    evidence: {},
+    metrics: {},
+    history: historyStates.map((s) => ({
+      state: s,
+      entered_at: "2026-01-01T00:00:00Z",
+      retries: 0,
+    })),
+    created_at: "2026-01-01T00:00:00Z",
+    updated_at: "2026-01-01T00:00:00Z",
+  });
+
+  it("returns role unchanged when no personaPool is set", () => {
+    const role = { ...baseRole };
+    const result = resolvePersonaForDispatch(
+      role,
+      "ping",
+      makeRuntime(["RED"], "RED"),
+      workflowDef,
+    );
+    expect(result).toBe(role);
+    expect(result.persona).toBeUndefined();
+  });
+
+  it("returns role unchanged when personaPool is empty", () => {
+    const role = { ...baseRole, personaPool: [] };
+    const result = resolvePersonaForDispatch(
+      role,
+      "ping",
+      makeRuntime(["RED"], "RED"),
+      workflowDef,
+    );
+    expect(result).toBe(role);
+  });
+
+  it("selects first persona on first dispatch of a role", () => {
+    const role = {
+      ...baseRole,
+      personaPool: [".team/a.md", ".team/b.md", ".team/c.md"],
+    };
+    // First dispatch of ping: RED is current, no prior ping states
+    const result = resolvePersonaForDispatch(
+      role,
+      "ping",
+      makeRuntime(["RED"], "RED"),
+      workflowDef,
+    );
+    expect(result.persona).toBe(".team/a.md");
+    expect(result).not.toBe(role); // shallow copy
+  });
+
+  it("counts only dispatches of the same role, ignoring other roles", () => {
+    const pingPool = [".team/a.md", ".team/b.md", ".team/c.md"];
+    const pingRole = { ...baseRole, personaPool: pingPool };
+
+    // History: RED(ping) → DOMAIN_REVIEW_TEST(reviewer) → GREEN(pong) →
+    //          DOMAIN_REVIEW_IMPL(reviewer) → RED(ping, current)
+    // Prior ping dispatches: just the first RED → count = 1 → pool[1]
+    const result = resolvePersonaForDispatch(
+      pingRole,
+      "ping",
+      makeRuntime(
+        ["RED", "DOMAIN_REVIEW_TEST", "GREEN", "DOMAIN_REVIEW_IMPL", "RED"],
+        "RED",
+      ),
+      workflowDef,
+    );
+    expect(result.persona).toBe(".team/b.md"); // index 1 % 3 = 1
+  });
+
+  it("gives pong its own independent rotation", () => {
+    const pongPool = [".team/x.md", ".team/y.md"];
+    const pongRole = { ...baseRole, personaPool: pongPool };
+
+    // History: RED(ping) → DOMAIN_REVIEW_TEST(reviewer) → GREEN(pong, current)
+    // Prior pong dispatches: none → count = 0 → pool[0]
+    const result = resolvePersonaForDispatch(
+      pongRole,
+      "pong",
+      makeRuntime(["RED", "DOMAIN_REVIEW_TEST", "GREEN"], "GREEN"),
+      workflowDef,
+    );
+    expect(result.persona).toBe(".team/x.md");
+  });
+
+  it("advances pong rotation only when pong states repeat", () => {
+    const pongPool = [".team/x.md", ".team/y.md"];
+    const pongRole = { ...baseRole, personaPool: pongPool };
+
+    // Two full cycles through, now at second GREEN dispatch
+    // Prior pong states (GREEN): 1 completed → count = 1 → pool[1]
+    const result = resolvePersonaForDispatch(
+      pongRole,
+      "pong",
+      makeRuntime(
+        [
+          "RED",
+          "DOMAIN_REVIEW_TEST",
+          "GREEN",
+          "DOMAIN_REVIEW_IMPL",
+          "RED",
+          "DOMAIN_REVIEW_TEST",
+          "GREEN",
+        ],
+        "GREEN",
+      ),
+      workflowDef,
+    );
+    expect(result.persona).toBe(".team/y.md"); // index 1 % 2 = 1
+  });
+
+  it("wraps around when role dispatch count exceeds pool size", () => {
+    const pool = [".team/x.md", ".team/y.md"];
+    const role = { ...baseRole, personaPool: pool };
+
+    // 3 prior RED dispatches for ping → count = 3 → 3 % 2 = 1
+    const result = resolvePersonaForDispatch(
+      role,
+      "ping",
+      makeRuntime(
+        [
+          "RED",
+          "DOMAIN_REVIEW_TEST",
+          "GREEN",
+          "DOMAIN_REVIEW_IMPL",
+          "RED",
+          "DOMAIN_REVIEW_TEST",
+          "GREEN",
+          "DOMAIN_REVIEW_IMPL",
+          "RED",
+          "DOMAIN_REVIEW_TEST",
+          "GREEN",
+          "DOMAIN_REVIEW_IMPL",
+          "RED",
+        ],
+        "RED",
+      ),
+      workflowDef,
+    );
+    expect(result.persona).toBe(".team/y.md");
+  });
+
+  it("does not mutate the original role definition", () => {
+    const role = {
+      ...baseRole,
+      personaPool: [".team/a.md", ".team/b.md"],
+    };
+    const result = resolvePersonaForDispatch(
+      role,
+      "ping",
+      makeRuntime(["RED"], "RED"),
+      workflowDef,
+    );
+    expect(result.persona).toBe(".team/a.md");
+    expect((role as Record<string, unknown>).persona).toBeUndefined();
+  });
+
+  it("domain_reviewer with fixed persona is unaffected by pool logic", () => {
+    const reviewerRole = {
+      ...baseRole,
+      persona: ".team/domain-specialist.md",
+    };
+    const result = resolvePersonaForDispatch(
+      reviewerRole,
+      "domain_reviewer",
+      makeRuntime(["RED", "DOMAIN_REVIEW_TEST"], "DOMAIN_REVIEW_TEST"),
+      workflowDef,
+    );
+    // No personaPool → returned as-is with fixed persona intact
+    expect(result).toBe(reviewerRole);
+    expect(result.persona).toBe(".team/domain-specialist.md");
+  });
+});
+
+describe("resolveWorkflowSlot", () => {
+  it("returns literal workflow names as-is", () => {
+    expect(resolveWorkflowSlot("tdd-ping-pong", {})).toBe("tdd-ping-pong");
+  });
+
+  it("resolves $slot references from params.slots", () => {
+    const params = {
+      slots: { build: "tdd-ping-pong", review: "three-stage-review" },
+    };
+    expect(resolveWorkflowSlot("$build", params)).toBe("tdd-ping-pong");
+    expect(resolveWorkflowSlot("$review", params)).toBe("three-stage-review");
+  });
+
+  it("throws when slot is not found", () => {
+    expect(() => resolveWorkflowSlot("$missing", {})).toThrow(
+      'slot "missing" not found',
+    );
+    expect(() =>
+      resolveWorkflowSlot("$missing", { slots: { other: "x" } }),
+    ).toThrow('slot "missing" not found');
+  });
+});
+
+describe("resolveInputMap", () => {
+  it("resolves params paths", () => {
+    const state: WorkflowRuntimeState = {
+      workflow_id: asWorkflowId("wf-1"),
+      workflow_type: asWorkflowType("test"),
+      current_state: "X",
+      retry_count: 0,
+      paused: false,
+      params: { scenario: "login", test_runner: "bun test" },
+      evidence: {},
+      metrics: {},
+      history: [],
+      created_at: "",
+      updated_at: "",
+    };
+
+    const result = resolveInputMap(
+      { scenario: "params.scenario", runner: "params.test_runner" },
+      state,
+    );
+    expect(result).toEqual({ scenario: "login", runner: "bun test" });
+  });
+
+  it("resolves evidence paths", () => {
+    const state: WorkflowRuntimeState = {
+      workflow_id: asWorkflowId("wf-1"),
+      workflow_type: asWorkflowType("test"),
+      current_state: "BUILD",
+      retry_count: 0,
+      paused: false,
+      params: {},
+      evidence: {
+        SETUP: {
+          branch: "feat/login",
+          acceptance_criteria: ["users can login"],
+        },
+      },
+      metrics: {},
+      history: [],
+      created_at: "",
+      updated_at: "",
+    };
+
+    const result = resolveInputMap(
+      {
+        branch: "evidence.SETUP.branch",
+        criteria: "evidence.SETUP.acceptance_criteria",
+      },
+      state,
+    );
+    expect(result).toEqual({
+      branch: "feat/login",
+      criteria: ["users can login"],
+    });
+  });
+
+  it("returns undefined for missing paths", () => {
+    const state: WorkflowRuntimeState = {
+      workflow_id: asWorkflowId("wf-1"),
+      workflow_type: asWorkflowType("test"),
+      current_state: "X",
+      retry_count: 0,
+      paused: false,
+      params: {},
+      evidence: {},
+      metrics: {},
+      history: [],
+      created_at: "",
+      updated_at: "",
+    };
+
+    const result = resolveInputMap({ x: "evidence.MISSING.field" }, state);
+    expect(result).toEqual({ x: undefined });
+  });
+
+  it("handles non-object intermediate in dotted path", () => {
+    const state: WorkflowRuntimeState = {
+      workflow_id: asWorkflowId("wf-1"),
+      workflow_type: asWorkflowType("test"),
+      current_state: "X",
+      retry_count: 0,
+      paused: false,
+      params: { val: "hello" },
+      evidence: {},
+      metrics: {},
+      history: [],
+      created_at: "",
+      updated_at: "",
+    };
+    // val is a string, can't traverse deeper
+    const result = resolveInputMap({ x: "params.val.deeper" }, state);
+    expect(result).toEqual({ x: undefined });
+  });
+
+  it("handles null intermediate value in dotted path", () => {
+    const state: WorkflowRuntimeState = {
+      workflow_id: asWorkflowId("wf-1"),
+      workflow_type: asWorkflowType("test"),
+      current_state: "X",
+      retry_count: 0,
+      paused: false,
+      params: { val: null },
+      evidence: {},
+      metrics: {},
+      history: [],
+      created_at: "",
+      updated_at: "",
+    };
+    const result = resolveInputMap({ x: "params.val.deeper" }, state);
+    expect(result).toEqual({ x: undefined });
+  });
+
+  it("returns empty object for empty inputMap", () => {
+    const state: WorkflowRuntimeState = {
+      workflow_id: asWorkflowId("wf-1"),
+      workflow_type: asWorkflowType("test"),
+      current_state: "X",
+      retry_count: 0,
+      paused: false,
+      params: { foo: "bar" },
+      evidence: {},
+      metrics: {},
+      history: [],
+      created_at: "",
+      updated_at: "",
+    };
+
+    expect(resolveInputMap({}, state)).toEqual({});
+  });
+});
+
+describe("subworkflow composition", () => {
+  // A simple child workflow: one agent state → terminal
+  const childWorkflowTs = `export default {
+    name: "child-wf",
+    description: "simple child",
+    initialState: "WORK",
+    roles: { w: { agent: "a", tools: ["read"], fileScope: { writable: [], readable: ["**"] } } },
+    states: {
+      WORK: { assign: "w", gate: { kind: "verdict", options: ["done"] }, transitions: { done: "DONE" } },
+      DONE: { type: "terminal", result: "success" },
+      FAIL: { type: "terminal", result: "failure" }
+    }
+  }`;
+
+  // A parent workflow with a subworkflow state
+  const parentWorkflowTs = `export default {
+    name: "parent-wf",
+    description: "parent with subworkflow",
+    initialState: "SETUP",
+    roles: { r: { agent: "a", tools: ["read"], fileScope: { writable: [], readable: ["**"] } } },
+    states: {
+      SETUP: { assign: "r", gate: { kind: "evidence", schema: { input: "string" } }, transitions: { pass: "DELEGATE", fail: "ESCALATE" } },
+      DELEGATE: { type: "subworkflow", workflow: "child-wf", inputMap: { data: "evidence.SETUP.input" }, transitions: { success: "DONE", failure: "ESCALATE" } },
+      DONE: { type: "terminal", result: "success" },
+      ESCALATE: { type: "terminal", result: "failure" }
+    }
+  }`;
+
+  // Parent using $slot reference
+  const slotParentWorkflowTs = `export default {
+    name: "slot-parent-wf",
+    description: "parent with slot-based subworkflow",
+    initialState: "DELEGATE",
+    roles: { r: { agent: "a", tools: ["read"], fileScope: { writable: [], readable: ["**"] } } },
+    states: {
+      DELEGATE: { type: "subworkflow", workflow: "$child", transitions: { success: "DONE", failure: "ESCALATE" } },
+      DONE: { type: "terminal", result: "success" },
+      ESCALATE: { type: "terminal", result: "failure" }
+    }
+  }`;
+
+  it("dispatches a subworkflow state by starting a child workflow", async () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "orch-sub-"));
+    writeWorkflow(
+      path.join(cwd, "src", "workflows"),
+      "child-wf",
+      childWorkflowTs,
+    );
+    writeWorkflow(
+      path.join(cwd, "src", "workflows"),
+      "parent-wf",
+      parentWorkflowTs,
+    );
+
+    const { pi } = createFakePi();
+    const store = new StateStore(path.join(cwd, ".orchestra"));
+    store.ensure();
+    const engine = new WorkflowEngine(pi, cwd, store);
+    await engine.loadWorkflows();
+
+    const parent = engine.start("parent-wf", {});
+
+    // Submit SETUP evidence to advance to DELEGATE
+    await engine.submitEvidence(parent.workflow_id, {
+      state: "SETUP",
+      result: "pass",
+      evidence: { input: "hello" },
+    });
+
+    const parentAfterSetup = engine.get(
+      parent.workflow_id,
+    ) as WorkflowRuntimeState;
+    expect(parentAfterSetup.current_state).toBe("DELEGATE");
+
+    // Dispatch triggers child workflow creation
+    const dispatch = await engine.dispatchCurrentState(parent.workflow_id);
+    expect(dispatch.dispatched).toBe(true);
+    expect(dispatch.details).toContain("Subworkflow");
+    expect(dispatch.details).toContain("child-wf");
+
+    // Verify parent has a child tracked
+    const parentWithChild = engine.get(
+      parent.workflow_id,
+    ) as WorkflowRuntimeState;
+    expect(parentWithChild.children).toBeDefined();
+    const childId = parentWithChild.children?.DELEGATE;
+    expect(childId).toBeDefined();
+
+    // Verify child has parent link
+    const child = engine.get(
+      childId as unknown as string,
+    ) as WorkflowRuntimeState;
+    expect(child.parent).toBeDefined();
+    expect(child.parent?.workflow_id).toBe(parent.workflow_id);
+    expect(child.parent?.state).toBe("DELEGATE");
+    expect(child.workflow_type).toBe("child-wf" as unknown as string);
+    expect(child.current_state).toBe("WORK");
+
+    // Verify child received mapped params
+    expect(child.params.data).toBe("hello");
+  });
+
+  it("propagates child completion back to parent", async () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "orch-sub-"));
+    writeWorkflow(
+      path.join(cwd, "src", "workflows"),
+      "child-wf",
+      childWorkflowTs,
+    );
+    writeWorkflow(
+      path.join(cwd, "src", "workflows"),
+      "parent-wf",
+      parentWorkflowTs,
+    );
+
+    const { pi } = createFakePi();
+    const store = new StateStore(path.join(cwd, ".orchestra"));
+    store.ensure();
+    const engine = new WorkflowEngine(pi, cwd, store);
+    await engine.loadWorkflows();
+
+    const parent = engine.start("parent-wf", {});
+    await engine.submitEvidence(parent.workflow_id, {
+      state: "SETUP",
+      result: "pass",
+      evidence: { input: "hello" },
+    });
+
+    await engine.dispatchCurrentState(parent.workflow_id);
+    const parentWithChild = engine.get(
+      parent.workflow_id,
+    ) as WorkflowRuntimeState;
+    const childId = parentWithChild.children?.DELEGATE as unknown as string;
+
+    // Complete the child workflow
+    await engine.submitEvidence(childId, {
+      state: "WORK",
+      result: "done",
+      evidence: { output: "finished" },
+    });
+
+    // Child should be at DONE terminal
+    const childDone = engine.get(childId) as WorkflowRuntimeState;
+    expect(childDone.current_state).toBe("DONE");
+
+    // Dispatch child's terminal state → triggers parent propagation
+    await engine.dispatchCurrentState(childId);
+
+    // Parent should have advanced past DELEGATE → DONE
+    const parentDone = engine.get(parent.workflow_id) as WorkflowRuntimeState;
+    expect(parentDone.current_state).toBe("DONE");
+
+    // Parent evidence should contain child evidence under DELEGATE
+    const delegateEvidence = parentDone.evidence.DELEGATE as Record<
+      string,
+      unknown
+    >;
+    expect(delegateEvidence.child_workflow_id).toBe(childId);
+    expect(delegateEvidence.child_result).toBe("success");
+    expect(
+      (delegateEvidence.child_evidence as Record<string, unknown>).WORK,
+    ).toBeDefined();
+  });
+
+  it("resolves $slot references from params.slots", async () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "orch-sub-"));
+    writeWorkflow(
+      path.join(cwd, "src", "workflows"),
+      "child-wf",
+      childWorkflowTs,
+    );
+    writeWorkflow(
+      path.join(cwd, "src", "workflows"),
+      "slot-parent-wf",
+      slotParentWorkflowTs,
+    );
+
+    const { pi } = createFakePi();
+    const store = new StateStore(path.join(cwd, ".orchestra"));
+    store.ensure();
+    const engine = new WorkflowEngine(pi, cwd, store);
+    await engine.loadWorkflows();
+
+    const parent = engine.start("slot-parent-wf", {
+      slots: { child: "child-wf" },
+    });
+
+    const dispatch = await engine.dispatchCurrentState(parent.workflow_id);
+    expect(dispatch.dispatched).toBe(true);
+    expect(dispatch.details).toContain("child-wf");
+
+    const parentState = engine.get(parent.workflow_id) as WorkflowRuntimeState;
+    const childId = parentState.children?.DELEGATE as unknown as string;
+    const child = engine.get(childId) as WorkflowRuntimeState;
+    expect(child.workflow_type).toBe("child-wf" as unknown as string);
+  });
+
+  it("throws when $slot reference cannot be resolved", async () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "orch-sub-"));
+    writeWorkflow(
+      path.join(cwd, "src", "workflows"),
+      "slot-parent-wf",
+      slotParentWorkflowTs,
+    );
+
+    const { pi } = createFakePi();
+    const store = new StateStore(path.join(cwd, ".orchestra"));
+    store.ensure();
+    const engine = new WorkflowEngine(pi, cwd, store);
+    await engine.loadWorkflows();
+
+    const parent = engine.start("slot-parent-wf", {}); // no slots!
+    await expect(
+      engine.dispatchCurrentState(parent.workflow_id),
+    ).rejects.toThrow('slot "child" not found');
+  });
+
+  it("throws when referenced subworkflow definition does not exist", async () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "orch-sub-"));
+    writeWorkflow(
+      path.join(cwd, "src", "workflows"),
+      "slot-parent-wf",
+      slotParentWorkflowTs,
+    );
+
+    const { pi } = createFakePi();
+    const store = new StateStore(path.join(cwd, ".orchestra"));
+    store.ensure();
+    const engine = new WorkflowEngine(pi, cwd, store);
+    await engine.loadWorkflows();
+
+    const parent = engine.start("slot-parent-wf", {
+      slots: { child: "nonexistent" },
+    });
+    await expect(
+      engine.dispatchCurrentState(parent.workflow_id),
+    ).rejects.toThrow('Subworkflow "nonexistent" not found');
+  });
+
+  it("propagates child failure to parent failure transition", async () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "orch-sub-"));
+
+    // Child that can fail
+    writeWorkflow(
+      path.join(cwd, "src", "workflows"),
+      "failing-child",
+      `export default {
+        name: "failing-child",
+        description: "child that fails",
+        initialState: "WORK",
+        roles: { w: { agent: "a", tools: ["read"], fileScope: { writable: [], readable: ["**"] } } },
+        states: {
+          WORK: { assign: "w", gate: { kind: "verdict", options: ["done", "fail_it"] }, transitions: { done: "OK", fail_it: "BAD" } },
+          OK: { type: "terminal", result: "success" },
+          BAD: { type: "terminal", result: "failure" }
+        }
+      }`,
+    );
+
+    writeWorkflow(
+      path.join(cwd, "src", "workflows"),
+      "parent-fail",
+      `export default {
+        name: "parent-fail",
+        description: "parent handling child failure",
+        initialState: "DELEGATE",
+        roles: {},
+        states: {
+          DELEGATE: { type: "subworkflow", workflow: "failing-child", transitions: { success: "DONE", failure: "FAILED" } },
+          DONE: { type: "terminal", result: "success" },
+          FAILED: { type: "terminal", result: "failure" }
+        }
+      }`,
+    );
+
+    const { pi } = createFakePi();
+    const store = new StateStore(path.join(cwd, ".orchestra"));
+    store.ensure();
+    const engine = new WorkflowEngine(pi, cwd, store);
+    await engine.loadWorkflows();
+
+    const parent = engine.start("parent-fail", {});
+    await engine.dispatchCurrentState(parent.workflow_id);
+
+    const parentState = engine.get(parent.workflow_id) as WorkflowRuntimeState;
+    const childId = parentState.children?.DELEGATE as unknown as string;
+
+    // Make child fail
+    await engine.submitEvidence(childId, {
+      state: "WORK",
+      result: "fail_it",
+      evidence: {},
+    });
+
+    // Dispatch child terminal → propagates failure to parent
+    await engine.dispatchCurrentState(childId);
+
+    const parentFinal = engine.get(parent.workflow_id) as WorkflowRuntimeState;
+    expect(parentFinal.current_state).toBe("FAILED");
+
+    const delegateEvidence = parentFinal.evidence.DELEGATE as Record<
+      string,
+      unknown
+    >;
+    expect(delegateEvidence.child_result).toBe("failure");
+  });
+
+  it("child evidence keys include child_workflow_type", async () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "orch-sub-"));
+    writeWorkflow(
+      path.join(cwd, "src", "workflows"),
+      "child-wf",
+      childWorkflowTs,
+    );
+    writeWorkflow(
+      path.join(cwd, "src", "workflows"),
+      "parent-wf",
+      parentWorkflowTs,
+    );
+
+    const { pi } = createFakePi();
+    const store = new StateStore(path.join(cwd, ".orchestra"));
+    store.ensure();
+    const engine = new WorkflowEngine(pi, cwd, store);
+    await engine.loadWorkflows();
+
+    const parent = engine.start("parent-wf", {});
+    await engine.submitEvidence(parent.workflow_id, {
+      state: "SETUP",
+      result: "pass",
+      evidence: { input: "data" },
+    });
+    await engine.dispatchCurrentState(parent.workflow_id);
+
+    const ps = engine.get(parent.workflow_id) as WorkflowRuntimeState;
+    const childId = ps.children?.DELEGATE as unknown as string;
+    await engine.submitEvidence(childId, {
+      state: "WORK",
+      result: "done",
+      evidence: { out: "ok" },
+    });
+    await engine.dispatchCurrentState(childId);
+
+    const parentDone = engine.get(parent.workflow_id) as WorkflowRuntimeState;
+    const ev = parentDone.evidence.DELEGATE as Record<string, unknown>;
+    expect(ev.child_workflow_type).toBe("child-wf");
+    expect(ev.child_workflow_id).toBeDefined();
+  });
+});
+
+describe("applyRoleOverrides", () => {
+  const baseRole = {
+    agent: "tdd-red",
+    tools: ["read", "bash"],
+    fileScope: { writable: ["tests/**"], readable: ["**"] },
+  };
+
+  const baseConfig: ProjectConfig = {
+    name: "test",
+    flavor: "event-modeled",
+    testRunner: "npm test",
+    buildCommand: "npm run build",
+    lintCommand: "npm run lint",
+    formatCheck: "npm run lint",
+    mutationTool: "stryker",
+    ciProvider: "github-actions",
+    testDir: "tests/**",
+    srcDir: "src/**",
+    typeDir: "src/**",
+    team: [],
+    roles: {},
+    autonomyLevel: "full",
+    humanReviewCadence: "end",
+    reworkBudget: 5,
+  };
+
+  it("returns role unchanged when no projectConfig is provided", () => {
+    const result = applyRoleOverrides(baseRole, "ping", undefined);
+    expect(result).toBe(baseRole);
+  });
+
+  it("returns role unchanged when no overrides match", () => {
+    const result = applyRoleOverrides(baseRole, "ping", baseConfig);
+    expect(result).toBe(baseRole);
+  });
+
+  it("overrides agent from project config", () => {
+    const config: ProjectConfig = {
+      ...baseConfig,
+      roles: { ping: { agent: "custom-red" } },
+    };
+    const result = applyRoleOverrides(baseRole, "ping", config);
+    expect(result.agent).toBe("custom-red");
+    expect(result.tools).toEqual(["read", "bash"]); // unchanged
+  });
+
+  it("overrides persona from project config", () => {
+    const config: ProjectConfig = {
+      ...baseConfig,
+      roles: { ping: { persona: ".team/alice.md" } },
+    };
+    const result = applyRoleOverrides(baseRole, "ping", config);
+    expect(result.persona).toBe(".team/alice.md");
+  });
+
+  it("overrides personaPool from project config", () => {
+    const config: ProjectConfig = {
+      ...baseConfig,
+      roles: {
+        ping: { personaPool: [".team/a.md", ".team/b.md"] },
+      },
+    };
+    const result = applyRoleOverrides(baseRole, "ping", config);
+    expect(result.personaPool).toEqual([".team/a.md", ".team/b.md"]);
+  });
+
+  it("overrides tools and fileScope from project config", () => {
+    const config: ProjectConfig = {
+      ...baseConfig,
+      roles: {
+        ping: {
+          tools: ["read", "bash", "edit"],
+          fileScope: { writable: ["src/**", "tests/**"] },
+        },
+      },
+    };
+    const result = applyRoleOverrides(baseRole, "ping", config);
+    expect(result.tools).toEqual(["read", "bash", "edit"]);
+    expect(result.fileScope.writable).toEqual(["src/**", "tests/**"]);
+    expect(result.fileScope.readable).toEqual(["**"]); // preserved from base
+  });
+
+  it("resolves personaTags from team members", () => {
+    const config: ProjectConfig = {
+      ...baseConfig,
+      team: [
+        { role: "alice", persona: ".team/alice.md", tags: ["tdd", "test"] },
+        { role: "bob", persona: ".team/bob.md", tags: ["tdd", "impl"] },
+        { role: "carol", persona: ".team/carol.md", tags: ["review"] },
+      ],
+      roles: {
+        ping: { personaTags: ["tdd", "test"] },
+      },
+    };
+    const result = applyRoleOverrides(baseRole, "ping", config);
+    // alice has both "tdd" and "test", bob has "tdd" — both match
+    expect(result.personaPool).toEqual([".team/alice.md", ".team/bob.md"]);
+    // personaTags clears fixed persona
+    expect(result.persona).toBeUndefined();
+  });
+
+  it("personaTags requires non-empty tags AND non-empty team", () => {
+    // Empty tags array → no resolution
+    const configEmptyTags: ProjectConfig = {
+      ...baseConfig,
+      team: [{ role: "a", persona: ".team/a.md", tags: ["tdd"] }],
+      roles: { ping: { personaTags: [] } },
+    };
+    const r1 = applyRoleOverrides(baseRole, "ping", configEmptyTags);
+    expect(r1.personaPool).toBeUndefined();
+
+    // Empty team → no resolution
+    const configEmptyTeam: ProjectConfig = {
+      ...baseConfig,
+      team: [],
+      roles: { ping: { personaTags: ["tdd"] } },
+    };
+    const r2 = applyRoleOverrides(baseRole, "ping", configEmptyTeam);
+    expect(r2.personaPool).toBeUndefined();
+  });
+
+  it("personaTags strips fixed persona when pool is resolved", () => {
+    const roleWithPersona = { ...baseRole, persona: ".team/existing.md" };
+    const config: ProjectConfig = {
+      ...baseConfig,
+      team: [{ role: "a", persona: ".team/a.md", tags: ["tdd"] }],
+      roles: { ping: { personaTags: ["tdd"] } },
+    };
+    const result = applyRoleOverrides(roleWithPersona, "ping", config);
+    expect(result.personaPool).toEqual([".team/a.md"]);
+    expect(result.persona).toBeUndefined();
+  });
+
+  it("personaTags with no matching team members leaves pool unchanged", () => {
+    const config: ProjectConfig = {
+      ...baseConfig,
+      team: [{ role: "carol", persona: ".team/carol.md", tags: ["review"] }],
+      roles: {
+        ping: { personaTags: ["tdd"] },
+      },
+    };
+    const result = applyRoleOverrides(baseRole, "ping", config);
+    // No team members have "tdd" tag
+    expect(result.personaPool).toBeUndefined();
+  });
+
+  it("override with only persona does not change agent or personaPool", () => {
+    const config: ProjectConfig = {
+      ...baseConfig,
+      roles: { ping: { persona: ".team/override.md" } },
+    };
+    const result = applyRoleOverrides(baseRole, "ping", config);
+    expect(result.agent).toBe("tdd-red"); // unchanged
+    expect(result.persona).toBe(".team/override.md"); // changed
+    expect(result.personaPool).toBeUndefined(); // not set
+    expect(result.personaFrom).toBeUndefined(); // not set
+  });
+
+  it("override with only personaFrom does not change agent or persona", () => {
+    const config: ProjectConfig = {
+      ...baseConfig,
+      roles: { ping: { personaFrom: "turn_persona" } },
+    };
+    const result = applyRoleOverrides(baseRole, "ping", config);
+    expect(result.agent).toBe("tdd-red");
+    expect(result.persona).toBeUndefined();
+    expect(result.personaFrom).toBe("turn_persona");
+  });
+
+  it("override with empty fields doesn't corrupt base role", () => {
+    const config: ProjectConfig = {
+      ...baseConfig,
+      roles: { ping: {} },
+    };
+    const result = applyRoleOverrides(baseRole, "ping", config);
+    expect(result.agent).toBe("tdd-red");
+    expect(result.tools).toEqual(["read", "bash"]);
+  });
+
+  it("personaTags in workflowRole prevents early return but doesn't resolve without config override", () => {
+    // Having personaTags on the role prevents early-return optimization
+    // but actual resolution needs the tags to come from config override
+    const roleWithTags = { ...baseRole, personaTags: ["tdd"] };
+    const config: ProjectConfig = {
+      ...baseConfig,
+      team: [{ role: "alice", persona: ".team/alice.md", tags: ["tdd"] }],
+    };
+    const result = applyRoleOverrides(roleWithTags, "ping", config);
+    // No config override with personaTags → pool not resolved
+    expect(result.personaPool).toBeUndefined();
+    // But it returns a copy, not the original
+    expect(result).not.toBe(roleWithTags);
+  });
+
+  it("team members without tags are not matched", () => {
+    const config: ProjectConfig = {
+      ...baseConfig,
+      team: [
+        { role: "alice", persona: ".team/alice.md" },
+        { role: "bob", persona: ".team/bob.md", tags: ["tdd"] },
+      ],
+      roles: { ping: { personaTags: ["tdd"] } },
+    };
+    const result = applyRoleOverrides(baseRole, "ping", config);
+    expect(result.personaPool).toEqual([".team/bob.md"]);
+  });
+
+  it("does not affect roles not mentioned in config", () => {
+    const config: ProjectConfig = {
+      ...baseConfig,
+      roles: { ping: { agent: "custom-red" } },
+    };
+    const result = applyRoleOverrides(baseRole, "pong", config);
+    expect(result).toBe(baseRole); // no override for pong
+  });
+
+  it("personaTags-resolved pool is used for rotation", () => {
+    const config: ProjectConfig = {
+      ...baseConfig,
+      team: [
+        { role: "alice", persona: ".team/alice.md", tags: ["tdd"] },
+        { role: "bob", persona: ".team/bob.md", tags: ["tdd"] },
+        { role: "carol", persona: ".team/carol.md", tags: ["tdd"] },
+      ],
+      roles: {
+        ping: { personaTags: ["tdd"] },
+      },
+    };
+
+    const workflowDef: WorkflowDefinition = {
+      name: "test",
+      description: "test",
+      roles: { ping: baseRole },
+      states: {
+        RED: {
+          assign: "ping",
+          gate: { kind: "evidence", schema: { out: "string" } },
+          transitions: { pass: "DONE" },
+        },
+        DONE: { type: "terminal" as const, result: "success" as const },
+      },
+    };
+
+    const configured = applyRoleOverrides(baseRole, "ping", config);
+    expect(configured.personaPool).toEqual([
+      ".team/alice.md",
+      ".team/bob.md",
+      ".team/carol.md",
+    ]);
+
+    // First dispatch → alice
+    const r0 = resolvePersonaForDispatch(
+      configured,
+      "ping",
+      {
+        workflow_id: asWorkflowId("wf"),
+        workflow_type: asWorkflowType("test"),
+        current_state: "RED",
+        retry_count: 0,
+        paused: false,
+        params: {},
+        evidence: {},
+        metrics: {},
+        history: [{ state: "RED", entered_at: "", retries: 0 }],
+        created_at: "",
+        updated_at: "",
+      },
+      workflowDef,
+    );
+    expect(r0.persona).toBe(".team/alice.md");
+
+    // Second dispatch (after one prior RED) → bob
+    const r1 = resolvePersonaForDispatch(
+      configured,
+      "ping",
+      {
+        workflow_id: asWorkflowId("wf"),
+        workflow_type: asWorkflowType("test"),
+        current_state: "RED",
+        retry_count: 0,
+        paused: false,
+        params: {},
+        evidence: {},
+        metrics: {},
+        history: [
+          { state: "RED", entered_at: "", retries: 0 },
+          { state: "RED", entered_at: "", retries: 0 },
+        ],
+        created_at: "",
+        updated_at: "",
+      },
+      workflowDef,
+    );
+    expect(r1.persona).toBe(".team/bob.md");
+  });
+});
+
+describe("project config role overrides with engine dispatch", () => {
+  it("uses config-specified persona in spawned agent prompt", async () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "orch-role-cfg-"));
+
+    // Write a persona file
+    const teamDir = path.join(cwd, ".team");
+    fs.mkdirSync(teamDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(teamDir, "alice.md"),
+      "# Alice\n\nI am a testing expert who values thoroughness.",
+      "utf8",
+    );
+
+    writeWorkflow(
+      path.join(cwd, "src", "workflows"),
+      "cfg-workflow",
+      `export default {
+        name: "cfg-workflow",
+        description: "config test",
+        initialState: "WORK",
+        roles: { worker: { agent: "a", tools: ["read"], fileScope: { writable: ["src/**"], readable: ["**"] } } },
+        states: {
+          WORK: { assign: "worker", gate: { kind: "verdict", options: ["done"] }, transitions: { done: "DONE" } },
+          DONE: { type: "terminal", result: "success" }
+        }
+      }`,
+    );
+
+    const { pi } = createFakePi();
+    const store = new StateStore(path.join(cwd, ".orchestra"));
+    store.ensure();
+    const engine = new WorkflowEngine(pi, cwd, store, {
+      name: "test-project",
+      flavor: "event-modeled",
+      testRunner: "bun test",
+      buildCommand: "bun run build",
+      lintCommand: "bun lint",
+      formatCheck: "bun lint",
+      mutationTool: "stryker",
+      ciProvider: "github-actions",
+      testDir: "tests/**",
+      srcDir: "src/**",
+      typeDir: "src/**",
+      team: [{ role: "alice", persona: ".team/alice.md", tags: ["dev"] }],
+      roles: {
+        worker: { persona: ".team/alice.md" },
+      },
+      autonomyLevel: "full",
+      humanReviewCadence: "end",
+      reworkBudget: 5,
+    });
+    await engine.loadWorkflows();
+
+    const state = engine.start("cfg-workflow", {});
+    await engine.dispatchCurrentState(state.workflow_id);
+
+    const runtimeDir = path.join(
+      cwd,
+      ".orchestra",
+      "runtime",
+      `${state.workflow_id}-worker`,
+    );
+    const prompt = fs.readFileSync(path.join(runtimeDir, "prompt.md"), "utf8");
+
+    expect(prompt).toContain("## Persona");
+    expect(prompt).toContain("Alice");
+    expect(prompt).toContain("testing expert");
+  });
+});
+
+describe("resolvePersonaFromParams", () => {
+  const baseRole = {
+    agent: "tdd-red",
+    tools: ["read", "bash"],
+    fileScope: { writable: ["tests/**"], readable: ["**"] },
+  };
+
+  it("returns role unchanged when no personaFrom is set", () => {
+    const result = resolvePersonaFromParams(baseRole, {
+      turn_persona: ".team/x.md",
+    });
+    expect(result).toBe(baseRole);
+  });
+
+  it("resolves persona from params when personaFrom is set", () => {
+    const role = { ...baseRole, personaFrom: "turn_persona" };
+    const result = resolvePersonaFromParams(role, {
+      turn_persona: ".team/kent.md",
+    });
+    expect(result.persona).toBe(".team/kent.md");
+    expect(result.personaPool).toBeUndefined();
+    expect(result).not.toBe(role); // shallow copy
+  });
+
+  it("clears personaPool when personaFrom resolves", () => {
+    const role = {
+      ...baseRole,
+      personaFrom: "turn_persona",
+      personaPool: [".team/a.md", ".team/b.md"],
+    };
+    const result = resolvePersonaFromParams(role, {
+      turn_persona: ".team/kent.md",
+    });
+    expect(result.persona).toBe(".team/kent.md");
+    expect(result.personaPool).toBeUndefined();
+  });
+
+  it("returns role unchanged when param value is not a string", () => {
+    const role = { ...baseRole, personaFrom: "turn_persona" };
+    const result = resolvePersonaFromParams(role, { turn_persona: 42 });
+    expect(result).toBe(role);
+  });
+
+  it("returns role unchanged when param key is missing", () => {
+    const role = { ...baseRole, personaFrom: "turn_persona" };
+    const result = resolvePersonaFromParams(role, {});
+    expect(result).toBe(role);
+  });
+});
+
+describe("personaFrom end-to-end via subworkflow", () => {
+  it("child workflow agents receive persona from parent params via inputMap", async () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "orch-pf-"));
+
+    // Write persona file
+    const teamDir = path.join(cwd, ".team");
+    fs.mkdirSync(teamDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(teamDir, "kent.md"),
+      "# Kent Beck\n\nI write the test that expresses the intent.",
+      "utf8",
+    );
+
+    // Child workflow: one role with personaFrom
+    writeWorkflow(
+      path.join(cwd, "src", "workflows"),
+      "turn-wf",
+      `export default {
+        name: "turn-wf",
+        description: "turn with persona from params",
+        initialState: "WORK",
+        roles: {
+          worker: {
+            agent: "a",
+            personaFrom: "turn_persona",
+            tools: ["read"],
+            fileScope: { writable: ["src/**"], readable: ["**"] }
+          }
+        },
+        states: {
+          WORK: { assign: "worker", gate: { kind: "verdict", options: ["done"] }, transitions: { done: "DONE" } },
+          DONE: { type: "terminal", result: "success" }
+        }
+      }`,
+    );
+
+    // Parent workflow: subworkflow that passes persona via inputMap
+    writeWorkflow(
+      path.join(cwd, "src", "workflows"),
+      "parent-pf",
+      `export default {
+        name: "parent-pf",
+        description: "parent passing persona to child",
+        initialState: "TURN",
+        roles: {},
+        states: {
+          TURN: {
+            type: "subworkflow",
+            workflow: "turn-wf",
+            inputMap: { turn_persona: "params.persona_a" },
+            transitions: { success: "DONE", failure: "DONE" }
+          },
+          DONE: { type: "terminal", result: "success" }
+        }
+      }`,
+    );
+
+    const { pi } = createFakePi();
+    const store = new StateStore(path.join(cwd, ".orchestra"));
+    store.ensure();
+    const engine = new WorkflowEngine(pi, cwd, store);
+    await engine.loadWorkflows();
+
+    // Start parent with persona_a
+    const parent = engine.start("parent-pf", {
+      persona_a: ".team/kent.md",
+    });
+
+    // Dispatch parent → starts child subworkflow
+    await engine.dispatchCurrentState(parent.workflow_id);
+
+    // Find the child
+    const parentState = engine.get(parent.workflow_id) as WorkflowRuntimeState;
+    const childId = parentState.children?.TURN as unknown as string;
+    const child = engine.get(childId) as WorkflowRuntimeState;
+
+    // Child should have received the persona in its params
+    expect(child.params.turn_persona).toBe(".team/kent.md");
+
+    // Dispatch child → spawns agent with personaFrom-resolved persona
+    await engine.dispatchCurrentState(childId);
+
+    // Verify the prompt contains the persona content
+    const runtimeDir = path.join(
+      cwd,
+      ".orchestra",
+      "runtime",
+      `${childId}-worker`,
+    );
+    const prompt = fs.readFileSync(path.join(runtimeDir, "prompt.md"), "utf8");
+    expect(prompt).toContain("## Persona");
+    expect(prompt).toContain("Kent Beck");
+    expect(prompt).toContain("expresses the intent");
   });
 });

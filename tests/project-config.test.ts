@@ -25,7 +25,15 @@ describe("project config", () => {
         flavor: "event-modeled",
         autonomyLevel: "assisted",
         humanReviewCadence: "every-slice",
-        team: [{ role: "pm", persona: ".team/pm.md" }, { nope: true }],
+        team: [
+          { role: "pm", persona: ".team/pm.md", tags: ["planning", "review"] },
+          { role: "dev", persona: ".team/dev.md" },
+          { nope: true },
+        ],
+        roles: {
+          ping: { personaTags: ["tdd"], agent: "custom-red" },
+          domain_reviewer: { persona: ".team/carol.md" },
+        },
       }),
     );
 
@@ -34,7 +42,14 @@ describe("project config", () => {
     expect(config.flavor).toBe("event-modeled");
     expect(config.autonomyLevel).toBe("assisted");
     expect(config.humanReviewCadence).toBe("every-slice");
-    expect(config.team).toEqual([{ role: "pm", persona: ".team/pm.md" }]);
+    expect(config.team).toEqual([
+      { role: "pm", persona: ".team/pm.md", tags: ["planning", "review"] },
+      { role: "dev", persona: ".team/dev.md" },
+    ]);
+    expect(config.roles).toEqual({
+      ping: { personaTags: ["tdd"], agent: "custom-red" },
+      domain_reviewer: { persona: ".team/carol.md" },
+    });
   });
 
   it("prefers .orchestra/project.ts when present", () => {
