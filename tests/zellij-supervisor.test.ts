@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   ZellijSupervisor,
   parsePaneInfos,
+  parseTabInfos,
 } from "../src/runtime/zellij-supervisor";
 
 describe("zellij-supervisor helpers", () => {
@@ -17,6 +18,30 @@ describe("zellij-supervisor helpers", () => {
       { id: "1", name: "conductor" },
       { id: "2", name: "agent-red" },
       { id: "3", name: undefined },
+    ]);
+  });
+
+  it("parses panes when ids are omitted or attributes use kdl style", () => {
+    const layout = `layout {
+  pane split_size="50%" name "orchestra-keepalive"
+  pane split_size="50%" {
+    name "agent-red"
+  }
+}`;
+
+    const panes = parsePaneInfos(layout);
+    expect(panes.length).toBeGreaterThan(0);
+    expect(panes.some((pane) => pane.name === "orchestra-keepalive")).toBe(
+      true,
+    );
+  });
+
+  it("parses tab names for current-session all-tab listing", () => {
+    const tabs = parseTabInfos("Tab #1\nagent-red\nagent-green");
+    expect(tabs).toEqual([
+      { id: "tab-1", name: "Tab #1" },
+      { id: "tab-2", name: "agent-red" },
+      { id: "tab-3", name: "agent-green" },
     ]);
   });
 });
@@ -53,24 +78,38 @@ describe("ZellijSupervisor", () => {
     expect(calls[0]?.args).toContain("agent-green");
   });
 
-  it("lists panes from zellij dump-layout", async () => {
+  it("lists current-session tabs via query-tab-names", async () => {
     const pi = {
-      exec: async () => ({
-        code: 0,
-        stdout: 'pane id="7" name="agent-review"\npane id="8"',
-        stderr: "",
-        killed: false,
-      }),
+      exec: async (_bin: string, args: string[]) => {
+        if (args.includes("query-tab-names")) {
+          return {
+            code: 0,
+            stdout: "orchestra-keepalive\nagent-review",
+            stderr: "",
+            killed: false,
+          };
+        }
+
+        return {
+          code: 1,
+          stdout: "",
+          stderr: "",
+          killed: false,
+        };
+      },
     } as unknown as ExtensionAPI;
 
     const supervisor = new ZellijSupervisor(pi);
     const panes = await supervisor.listPanes();
 
     expect(panes).toEqual([
-      { id: "7", name: "agent-review" },
-      { id: "8", name: undefined },
+      { id: "tab-1", name: "orchestra-keepalive" },
+      { id: "tab-2", name: "agent-review" },
     ]);
-    expect(supervisor.getTrackedPaneIds()).toEqual({ "agent-review": "7" });
+    expect(supervisor.getTrackedPaneIds()).toEqual({
+      "orchestra-keepalive": "tab-1",
+      "agent-review": "tab-2",
+    });
   });
 
   it("reconciles missing panes and tracks id changes", async () => {

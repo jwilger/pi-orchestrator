@@ -700,6 +700,104 @@ describe("WorkflowEngine", () => {
     expect(commands).toContain("echo two");
   });
 
+  it("records spawn failure details and fails dispatch when zellij spawn fails", async () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "orch-engine-"));
+
+    writeWorkflow(
+      path.join(cwd, "src", "workflows"),
+      "spawn-fail-workflow",
+      `export default {
+        name: "spawn-fail-workflow",
+        description: "spawn fail",
+        initialState: "WORK",
+        roles: { worker: { agent: "a", tools: ["read"], fileScope: { writable: ["src/**"], readable: ["**"] } } },
+        states: {
+          WORK: { assign: "worker", gate: { kind: "verdict", options: ["done"] }, transitions: { done: "DONE" } },
+          DONE: { type: "terminal", result: "success" }
+        }
+      }`,
+    );
+
+    const pi = {
+      exec: async (_bin: string, args: string[]) => {
+        const command = args[1] ?? "";
+        if (command.includes("zellij action new-tab")) {
+          return {
+            code: 1,
+            stdout: "",
+            stderr: "zellij unavailable",
+            killed: false,
+          };
+        }
+        return { code: 0, stdout: "", stderr: "", killed: false };
+      },
+    } as unknown as ExtensionAPI;
+
+    const store = new StateStore(path.join(cwd, ".orchestra"));
+    store.ensure();
+    const engine = new WorkflowEngine(pi, cwd, store);
+
+    await engine.loadWorkflows();
+    const state = engine.start("spawn-fail-workflow", {});
+
+    await expect(
+      engine.dispatchCurrentState(state.workflow_id),
+    ).rejects.toThrow("stderr=zellij unavailable");
+
+    const loaded = engine.get(state.workflow_id);
+    expect(loaded?.metrics.agent_spawn_failure).toMatchObject({
+      state: "WORK",
+      role: "worker",
+      code: 1,
+      stderr: "zellij unavailable",
+    });
+  });
+
+  it("uses fallback stderr marker when spawn failure stderr is empty", async () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "orch-engine-"));
+
+    writeWorkflow(
+      path.join(cwd, "src", "workflows"),
+      "spawn-fail-empty-stderr",
+      `export default {
+        name: "spawn-fail-empty-stderr",
+        description: "spawn fail",
+        initialState: "WORK",
+        roles: { worker: { agent: "a", tools: ["read"], fileScope: { writable: ["src/**"], readable: ["**"] } } },
+        states: {
+          WORK: { assign: "worker", gate: { kind: "verdict", options: ["done"] }, transitions: { done: "DONE" } },
+          DONE: { type: "terminal", result: "success" }
+        }
+      }`,
+    );
+
+    const pi = {
+      exec: async (_bin: string, args: string[]) => {
+        const command = args[1] ?? "";
+        if (command.includes("zellij action new-tab")) {
+          return {
+            code: 1,
+            stdout: "",
+            stderr: "",
+            killed: false,
+          };
+        }
+        return { code: 0, stdout: "", stderr: "", killed: false };
+      },
+    } as unknown as ExtensionAPI;
+
+    const store = new StateStore(path.join(cwd, ".orchestra"));
+    store.ensure();
+    const engine = new WorkflowEngine(pi, cwd, store);
+
+    await engine.loadWorkflows();
+    const state = engine.start("spawn-fail-empty-stderr", {});
+
+    await expect(
+      engine.dispatchCurrentState(state.workflow_id),
+    ).rejects.toThrow("stderr=(none)");
+  });
+
   it("supports command gate with non-zero expected exit code", async () => {
     const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "orch-engine-"));
 
