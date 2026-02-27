@@ -13,11 +13,17 @@
 - CI + release + publish + branch protections
 - Mutation testing gate at 100%
 
-## Candidate follow-on milestones (explicitly deferred unless needed)
+## Deferred milestone closure status (`$200` loop)
 
-1. Rich custom TUI components with interactive tables/sections (beyond text widgets)
-2. Automated background scheduler for periodic health checks/escalations
-3. Model tuner A/B experiment automation and rollback policies
-4. Deep zellij recovery orchestration (pane-id tracking + auto-respawn strategies)
-5. Rich evidence schema registry + validation diagnostics UI
-6. Full packaged defaults for `.orchestra/project.ts` bootstrap generation command
+All previously deferred follow-on milestones are now implemented:
+
+1. ✅ Rich custom TUI components with interactive tables/sections (`/orchestra dashboard`, `orchestra_dashboard_view`)
+2. ✅ Automated background scheduler for periodic health checks/escalations (`HealthScheduler`, `/orchestra health`, `orchestra_health_status`)
+3. ✅ Model tuner A/B experiment automation and rollback policies (`orchestra_tuning_experiment_*`, persisted experiments/assignments)
+4. ✅ Deep zellij recovery orchestration (pane-id tracking + auto-respawn via `reconcilePanes`, `/orchestra pane-recover`)
+5. ✅ Rich evidence schema registry + validation diagnostics UI (`orchestra_evidence_schema_registry`, `orchestra_evidence_diagnostics`)
+6. ✅ Full packaged defaults for `.orchestra/project.ts` bootstrap generation command (`orchestra_project_bootstrap`, `/orchestra project-bootstrap`)
+
+## Remaining deferred items
+
+- None.

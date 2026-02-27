@@ -20,7 +20,7 @@ export interface ProjectConfig {
   reworkBudget: number;
 }
 
-const defaultProjectConfig: ProjectConfig = {
+export const defaultProjectConfig: ProjectConfig = {
   name: "unknown-project",
   flavor: "traditional-prd",
   testRunner: "npm test",

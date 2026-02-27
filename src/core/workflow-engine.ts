@@ -2,6 +2,7 @@ import path from "node:path";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { createJiti } from "jiti";
 import { nanoid } from "nanoid";
+import { validateEvidenceForState } from "../evidence/schema-registry";
 import type { StateStore } from "./state-store";
 import {
   type WorkflowDefinition,
@@ -66,6 +67,14 @@ export class WorkflowEngine {
 
   get(workflowId: string): WorkflowRuntimeState | null {
     return this.store.loadWorkflowState(asWorkflowId(workflowId));
+  }
+
+  listDefinitions(): WorkflowDefinition[] {
+    return [...this.workflows.values()];
+  }
+
+  getDefinition(workflowType: string): WorkflowDefinition | undefined {
+    return this.workflows.get(workflowType);
   }
 
   start(
@@ -143,6 +152,27 @@ export class WorkflowEngine {
 
     let verified = true;
     if (currentDefinition.gate.kind === "evidence") {
+      const validation = validateEvidenceForState(
+        state.current_state,
+        currentDefinition.gate.schema,
+        submission.evidence,
+      );
+      if (!validation.ok) {
+        state.evidence[state.current_state] = {
+          ...submission.evidence,
+          verified: false,
+          validation_errors: validation.errors,
+        };
+        state.updated_at = new Date().toISOString();
+        this.store.saveWorkflowState(state);
+        return {
+          workflowId,
+          status: "rejected",
+          reason: "Evidence schema validation failed",
+          diagnostics: validation,
+        };
+      }
+
       const verify = currentDefinition.gate.verify;
       if (verify) {
         const result = await this.execCommand(verify.command);

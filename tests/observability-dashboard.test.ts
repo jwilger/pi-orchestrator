@@ -3,6 +3,7 @@ import { asWorkflowId, asWorkflowType } from "../src/core/types";
 import {
   buildActionLines,
   buildCommandHelpLines,
+  buildInteractiveDashboardLines,
   buildOverviewLines,
   buildRetroApplyLines,
   buildTuningLines,
@@ -91,7 +92,11 @@ describe("observability dashboard helpers", () => {
   it("builds workflow detail lines", () => {
     expect(buildWorkflowDetailLines(null)).toEqual(["workflow not found"]);
     expect(buildActionLines([])).toEqual(["No actions available"]);
-    expect(buildCommandHelpLines().length).toBeGreaterThan(5);
+    const help = buildCommandHelpLines();
+    expect(help.length).toBeGreaterThan(5);
+    expect(help.some((line) => line.includes("/orchestra dashboard"))).toBe(
+      true,
+    );
 
     const detail = buildWorkflowDetailLines({
       workflow_id: asWorkflowId("wf-detail"),
@@ -117,5 +122,70 @@ describe("observability dashboard helpers", () => {
       true,
     );
     expect(detail.some((line) => line.includes("RED -> pass"))).toBe(true);
+  });
+
+  it("builds interactive dashboard table views", () => {
+    const workflows = [
+      {
+        workflow_id: asWorkflowId("wf-1"),
+        workflow_type: asWorkflowType("pipeline"),
+        current_state: "RED",
+        retry_count: 0,
+        paused: false,
+        params: {},
+        history: [],
+        evidence: {},
+        metrics: {},
+        created_at: "x",
+        updated_at: "x",
+      },
+    ];
+
+    const lines = buildInteractiveDashboardLines({
+      section: "tuning",
+      page: 1,
+      pageSize: 5,
+      workflows,
+      paneRows: [{ id: "1", name: "conductor" }],
+      recommendations: [
+        {
+          role: "reviewer",
+          phase: "REVIEW",
+          current_model: "claude-haiku-4",
+          recommended_model: "claude-sonnet-4",
+          rationale: "quality",
+        },
+      ],
+      experiments: [
+        {
+          id: "exp-1",
+          role: "reviewer",
+          phase: "REVIEW",
+          baseline_model: "claude-haiku-4",
+          challenger_model: "claude-sonnet-4",
+          status: "complete",
+          created_at: "x",
+          completed_at: "y",
+          decision: "promote_challenger",
+          rationale: "better",
+        },
+      ],
+      assignments: [
+        {
+          role: "reviewer",
+          phase: "REVIEW",
+          model: "claude-sonnet-4",
+          reason: "promoted",
+          updated_at: "y",
+        },
+      ],
+      healthChecks: [{ name: "panes", ok: true, message: "panes=1" }],
+    });
+
+    expect(lines.some((line) => line.includes("=== tuning ==="))).toBe(true);
+    expect(lines.some((line) => line.includes("recommendations=1"))).toBe(true);
+    expect(lines.some((line) => line.includes("promote_challenger"))).toBe(
+      true,
+    );
   });
 });
