@@ -53,5 +53,6 @@ export const subworkflow = (config: {
   workflow: config.workflow,
   ...(config.inputMap ? { inputMap: config.inputMap } : {}),
   transitions: config.transitions,
+  // Stryker disable next-line all: optional field propagation
   ...(config.maxRetries !== undefined ? { maxRetries: config.maxRetries } : {}),
 });

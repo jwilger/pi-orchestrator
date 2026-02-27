@@ -1079,6 +1079,55 @@ describe("WorkflowEngine", () => {
   });
 });
 
+describe("WorkflowEngine.setProjectConfig", () => {
+  it("stores project config for later dispatch use", async () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "orch-cfg-"));
+    writeWorkflow(
+      path.join(cwd, "src", "workflows"),
+      "simple",
+      `export default {
+        name: "simple",
+        description: "simple",
+        initialState: "WORK",
+        roles: { r: { agent: "a", tools: ["read"], fileScope: { writable: [], readable: ["**"] } } },
+        states: {
+          WORK: { assign: "r", gate: { kind: "evidence", schema: { x: "string" } }, transitions: { pass: "DONE" } },
+          DONE: { type: "terminal", result: "success" }
+        }
+      }`,
+    );
+    const { pi } = createFakePi();
+    const store = new StateStore(path.join(cwd, ".orchestra"));
+    store.ensure();
+    const engine = new WorkflowEngine(pi, cwd, store);
+    await engine.loadWorkflows();
+
+    const config: ProjectConfig = {
+      name: "test",
+      flavor: "event-modeled",
+      testRunner: "bun test",
+      buildCommand: "bun run build",
+      lintCommand: "bun run lint",
+      formatCheck: "bun run fmt",
+      mutationTool: "stryker",
+      ciProvider: "github-actions",
+      testDir: "tests/**",
+      srcDir: "src/**",
+      typeDir: "src/**",
+      reworkBudget: 3,
+      autonomyLevel: "full",
+      humanReviewCadence: "end",
+      team: [],
+      roles: {},
+    };
+    engine.setProjectConfig(config);
+
+    // The engine should use the config when dispatching
+    const state = engine.start("simple", {});
+    expect(state.current_state).toBe("WORK");
+  });
+});
+
 describe("workflow-engine helpers", () => {
   it("shellEscape escapes single quotes", () => {
     expect(shellEscape("ab'cd")).toBe("ab'\\''cd");
@@ -1318,6 +1367,41 @@ describe("buildAgentPrompt", () => {
     expect(prompt).toContain("read-only role");
   });
 
+  it("describes command gate in workflow context", () => {
+    const prompt = buildAgentPrompt(
+      makePromptInput({
+        state: "CHECK",
+        stateDefinition: {
+          assign: "r",
+          gate: { kind: "command", verify: { command: "make test" } },
+          transitions: { pass: "DONE" },
+        },
+      }),
+    );
+    expect(prompt).toContain("Gate kind: command");
+    expect(prompt).toContain("make test");
+  });
+
+  it("describes evidence gate with field names", () => {
+    const prompt = buildAgentPrompt(
+      makePromptInput({
+        stateDefinition: {
+          assign: "r",
+          gate: {
+            kind: "evidence",
+            schema: { branch: "string", count: "number" },
+          },
+          transitions: { pass: "NEXT" },
+        },
+      }),
+    );
+    expect(prompt).toContain("Gate kind: evidence");
+    expect(prompt).toContain("branch: string");
+    expect(prompt).toContain("count: number");
+    // Tool instructions reference the fields
+    expect(prompt).toContain("branch, count");
+  });
+
   it("describes verdict gate in tool instructions", () => {
     const prompt = buildAgentPrompt(
       makePromptInput({
@@ -1343,6 +1427,27 @@ describe("buildAgentTask", () => {
     expect(task).toContain("Execute state RED for workflow wf-123");
     expect(task).toContain("RED phase of TDD");
     expect(task).toContain("failing test");
+    expect(task).toContain("`npm test`");
+    // Discriminate from GREEN
+    expect(task).not.toContain("GREEN phase");
+    expect(task).not.toContain("minimal production code");
+  });
+
+  it("includes state-specific instructions for RED_ prefixed state", () => {
+    const task = buildAgentTask(
+      makeTaskInput({
+        state: "RED_UNIT",
+        stateDefinition: {
+          assign: "red",
+          gate: {
+            kind: "evidence",
+            schema: { test_file: "string", failure_output: "string" },
+          },
+          transitions: { pass: "DONE" },
+        },
+      }),
+    );
+    expect(task).toContain("RED phase of TDD");
   });
 
   it("includes state-specific instructions for GREEN state", () => {
@@ -1362,6 +1467,73 @@ describe("buildAgentTask", () => {
 
     expect(task).toContain("GREEN phase of TDD");
     expect(task).toContain("minimal production code");
+    expect(task).toContain("`npm test`");
+    // Discriminate from RED
+    expect(task).not.toContain("RED phase of TDD");
+    expect(task).not.toContain("Write a failing test");
+  });
+
+  it("includes state-specific instructions for GREEN_ prefixed state", () => {
+    const task = buildAgentTask(
+      makeTaskInput({
+        state: "GREEN_IMPL",
+        stateDefinition: {
+          assign: "green",
+          gate: {
+            kind: "evidence",
+            schema: { impl: "string" },
+          },
+          transitions: { pass: "DONE" },
+        },
+      }),
+    );
+    expect(task).toContain("GREEN phase of TDD");
+  });
+
+  it("includes state-specific instructions for REFACTOR state", () => {
+    const task = buildAgentTask(
+      makeTaskInput({
+        state: "REFACTOR",
+        stateDefinition: {
+          assign: "r",
+          gate: { kind: "evidence", schema: { files: "string[]" } },
+          transitions: { pass: "DONE" },
+        },
+      }),
+    );
+    expect(task).toContain("REFACTOR phase");
+    expect(task).toContain("without changing behavior");
+    expect(task).not.toContain("RED phase");
+    expect(task).not.toContain("GREEN phase");
+  });
+
+  it("includes state-specific instructions for REFACTOR_ prefixed state", () => {
+    const task = buildAgentTask(
+      makeTaskInput({
+        state: "REFACTOR_TYPES",
+        stateDefinition: {
+          assign: "r",
+          gate: { kind: "evidence", schema: { files: "string[]" } },
+          transitions: { pass: "DONE" },
+        },
+      }),
+    );
+    expect(task).toContain("REFACTOR phase");
+  });
+
+  it("includes state-specific instructions for PIPELINE state", () => {
+    const task = buildAgentTask(
+      makeTaskInput({
+        state: "PIPELINE",
+        stateDefinition: {
+          assign: "p",
+          gate: { kind: "verdict", options: ["complete", "retry"] },
+          transitions: { complete: "DONE", retry: "PIPELINE" },
+        },
+      }),
+    );
+    expect(task).toContain("pipeline agent");
+    expect(task).toContain("acceptance criteria");
   });
 
   it("includes state-specific instructions for TDD_CYCLE state", () => {
@@ -1394,6 +1566,67 @@ describe("buildAgentTask", () => {
 
     expect(task).toContain("Review the code changes");
     expect(task).toContain("approved' or 'flagged'");
+  });
+
+  it("includes state-specific instructions for REVIEW with non-verdict gate", () => {
+    const task = buildAgentTask(
+      makeTaskInput({
+        state: "REVIEW",
+        stateDefinition: {
+          assign: "reviewer",
+          gate: { kind: "evidence", schema: { summary: "string" } },
+          transitions: { pass: "DONE" },
+        },
+      }),
+    );
+    expect(task).toContain(
+      "Review the code changes and submit your assessment",
+    );
+  });
+
+  it("includes SETUP instructions", () => {
+    const task = buildAgentTask(
+      makeTaskInput({
+        state: "SETUP",
+        stateDefinition: {
+          assign: "r",
+          gate: { kind: "evidence", schema: { branch: "string" } },
+          transitions: { pass: "NEXT" },
+        },
+      }),
+    );
+    expect(task).toContain("Set up the workspace");
+    expect(task).toContain("initial evidence");
+  });
+
+  it("provides fallback for verdict gate on unknown state", () => {
+    const task = buildAgentTask(
+      makeTaskInput({
+        state: "CUSTOM_VERDICT",
+        stateDefinition: {
+          assign: "r",
+          gate: { kind: "verdict", options: ["yes", "no"] },
+          transitions: { yes: "DONE", no: "FAIL" },
+        },
+      }),
+    );
+    expect(task).toContain("Evaluate the current state");
+    expect(task).toContain("yes or no");
+  });
+
+  it("provides fallback for command gate on unknown state", () => {
+    const task = buildAgentTask(
+      makeTaskInput({
+        state: "CUSTOM_CMD",
+        stateDefinition: {
+          assign: "r",
+          gate: { kind: "command", verify: { command: "make test" } },
+          transitions: { pass: "DONE" },
+        },
+      }),
+    );
+    expect(task).toContain("Complete the work for state CUSTOM_CMD");
+    expect(task).toContain("verification command passes");
   });
 
   it("includes evidence from prior states", () => {
@@ -1579,6 +1812,166 @@ describe("buildAgentTask", () => {
     );
 
     expect(task).toContain("Complete the work for state CUSTOM_PHASE");
+  });
+
+  it("uses 'pass' as default result in evidence example", () => {
+    const task = buildAgentTask(makeTaskInput());
+    expect(task).toContain('"result": "pass"');
+    expect(task).toContain(`"state": "RED"`);
+  });
+
+  it("uses first verdict option as default in verdict example", () => {
+    const task = buildAgentTask(
+      makeTaskInput({
+        state: "REVIEW",
+        stateDefinition: {
+          assign: "r",
+          gate: { kind: "verdict", options: ["pass_it", "fail_it"] },
+          transitions: { pass_it: "DONE", fail_it: "BACK" },
+        },
+      }),
+    );
+    expect(task).toContain('"result": "pass_it"');
+    expect(task).toContain(`"state": "REVIEW"`);
+  });
+
+  it("fallback retry message when history has no last_failure", () => {
+    const task = buildAgentTask(
+      makeTaskInput({
+        runtimeState: {
+          workflow_id: asWorkflowId("wf-retry"),
+          workflow_type: asWorkflowType("test-workflow"),
+          current_state: "RED",
+          retry_count: 1,
+          paused: false,
+          params: {},
+          evidence: {},
+          metrics: {},
+          history: [
+            { state: "RED", entered_at: "2026-01-01T00:00:00Z", retries: 1 },
+          ],
+          created_at: "2026-01-01T00:00:00Z",
+          updated_at: "2026-01-01T00:00:00Z",
+        },
+      }),
+    );
+    expect(task).toContain("retry #1");
+    expect(task).toContain("Previous attempt failed gate verification");
+  });
+
+  it("omits workflow params when empty", () => {
+    const task = buildAgentTask(makeTaskInput());
+    expect(task).not.toContain("## Workflow Parameters");
+  });
+
+  it("omits prior evidence section when evidence is empty", () => {
+    const task = buildAgentTask(makeTaskInput());
+    expect(task).not.toContain("## Evidence from Prior States");
+  });
+
+  it("prompt tool instructions mention state name in result parameter", () => {
+    const prompt = buildAgentPrompt(
+      makePromptInput({
+        state: "IMPL",
+        stateDefinition: {
+          assign: "r",
+          gate: {
+            kind: "evidence",
+            schema: { out: "string" },
+          },
+          transitions: { pass: "DONE" },
+        },
+      }),
+    );
+    expect(prompt).toContain(`"IMPL"`);
+    expect(prompt).toContain("out");
+  });
+
+  it("prompt shows current state name", () => {
+    const prompt = buildAgentPrompt(
+      makePromptInput({
+        state: "VERIFY",
+      }),
+    );
+    expect(prompt).toContain("Current state: VERIFY");
+  });
+
+  it("prompt shows role name correctly", () => {
+    const prompt = buildAgentPrompt(
+      makePromptInput({
+        role: "custom_role",
+      }),
+    );
+    expect(prompt).toContain("# Role: custom_role");
+    expect(prompt).toContain("Your role: custom_role");
+  });
+
+  it("prompt shows workflow name and description", () => {
+    const prompt = buildAgentPrompt(
+      makePromptInput({
+        workflowDefinition: {
+          name: "my-workflow",
+          description: "Does important things",
+          initialState: "START",
+          roles: {},
+          states: {},
+        },
+      }),
+    );
+    expect(prompt).toContain("my-workflow — Does important things");
+  });
+
+  it("prompt shows build command in project context", () => {
+    const prompt = buildAgentPrompt(
+      makePromptInput({
+        projectConfig: {
+          name: "test-proj",
+          flavor: "traditional-prd",
+          testRunner: "jest",
+          buildCommand: "make build",
+          lintCommand: "eslint",
+          formatCheck: "prettier",
+          mutationTool: "stryker",
+          ciProvider: "github-actions",
+          testDir: "test/**",
+          srcDir: "lib/**",
+          typeDir: "lib/**",
+          team: [],
+          autonomyLevel: "assisted",
+          humanReviewCadence: "every-slice",
+          reworkBudget: 3,
+        },
+      }),
+    );
+    expect(prompt).toContain("Build command: make build");
+    expect(prompt).toContain("Autonomy level: assisted");
+    expect(prompt).toContain("Source directory: lib/**");
+    expect(prompt).toContain("Test directory: test/**");
+  });
+
+  it("prompt file scope lists multiple writable patterns", () => {
+    const prompt = buildAgentPrompt(
+      makePromptInput({
+        roleDefinition: {
+          agent: "dev",
+          tools: ["read", "bash"],
+          fileScope: {
+            writable: ["src/**", "tests/**"],
+            readable: ["docs/**", "config/**"],
+          },
+        },
+      }),
+    );
+    expect(prompt).toContain("Writable: src/**, tests/**");
+    expect(prompt).toContain("Readable: docs/**, config/**");
+  });
+
+  it("prompt always reminds agent to submit evidence", () => {
+    const prompt = buildAgentPrompt(makePromptInput());
+    expect(prompt).toContain(
+      "Always call `submit_evidence` when your work is complete",
+    );
+    expect(prompt).toContain("workflow cannot advance otherwise");
   });
 });
 
@@ -1932,6 +2325,43 @@ describe("resolveInputMap", () => {
     expect(result).toEqual({ x: undefined });
   });
 
+  it("handles non-object intermediate in dotted path", () => {
+    const state: WorkflowRuntimeState = {
+      workflow_id: asWorkflowId("wf-1"),
+      workflow_type: asWorkflowType("test"),
+      current_state: "X",
+      retry_count: 0,
+      paused: false,
+      params: { val: "hello" },
+      evidence: {},
+      metrics: {},
+      history: [],
+      created_at: "",
+      updated_at: "",
+    };
+    // val is a string, can't traverse deeper
+    const result = resolveInputMap({ x: "params.val.deeper" }, state);
+    expect(result).toEqual({ x: undefined });
+  });
+
+  it("handles null intermediate value in dotted path", () => {
+    const state: WorkflowRuntimeState = {
+      workflow_id: asWorkflowId("wf-1"),
+      workflow_type: asWorkflowType("test"),
+      current_state: "X",
+      retry_count: 0,
+      paused: false,
+      params: { val: null },
+      evidence: {},
+      metrics: {},
+      history: [],
+      created_at: "",
+      updated_at: "",
+    };
+    const result = resolveInputMap({ x: "params.val.deeper" }, state);
+    expect(result).toEqual({ x: undefined });
+  });
+
   it("returns empty object for empty inputMap", () => {
     const state: WorkflowRuntimeState = {
       workflow_id: asWorkflowId("wf-1"),
@@ -2189,6 +2619,116 @@ describe("subworkflow composition", () => {
       engine.dispatchCurrentState(parent.workflow_id),
     ).rejects.toThrow('Subworkflow "nonexistent" not found');
   });
+
+  it("propagates child failure to parent failure transition", async () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "orch-sub-"));
+
+    // Child that can fail
+    writeWorkflow(
+      path.join(cwd, "src", "workflows"),
+      "failing-child",
+      `export default {
+        name: "failing-child",
+        description: "child that fails",
+        initialState: "WORK",
+        roles: { w: { agent: "a", tools: ["read"], fileScope: { writable: [], readable: ["**"] } } },
+        states: {
+          WORK: { assign: "w", gate: { kind: "verdict", options: ["done", "fail_it"] }, transitions: { done: "OK", fail_it: "BAD" } },
+          OK: { type: "terminal", result: "success" },
+          BAD: { type: "terminal", result: "failure" }
+        }
+      }`,
+    );
+
+    writeWorkflow(
+      path.join(cwd, "src", "workflows"),
+      "parent-fail",
+      `export default {
+        name: "parent-fail",
+        description: "parent handling child failure",
+        initialState: "DELEGATE",
+        roles: {},
+        states: {
+          DELEGATE: { type: "subworkflow", workflow: "failing-child", transitions: { success: "DONE", failure: "FAILED" } },
+          DONE: { type: "terminal", result: "success" },
+          FAILED: { type: "terminal", result: "failure" }
+        }
+      }`,
+    );
+
+    const { pi } = createFakePi();
+    const store = new StateStore(path.join(cwd, ".orchestra"));
+    store.ensure();
+    const engine = new WorkflowEngine(pi, cwd, store);
+    await engine.loadWorkflows();
+
+    const parent = engine.start("parent-fail", {});
+    await engine.dispatchCurrentState(parent.workflow_id);
+
+    const parentState = engine.get(parent.workflow_id) as WorkflowRuntimeState;
+    const childId = parentState.children?.DELEGATE as unknown as string;
+
+    // Make child fail
+    await engine.submitEvidence(childId, {
+      state: "WORK",
+      result: "fail_it",
+      evidence: {},
+    });
+
+    // Dispatch child terminal → propagates failure to parent
+    await engine.dispatchCurrentState(childId);
+
+    const parentFinal = engine.get(parent.workflow_id) as WorkflowRuntimeState;
+    expect(parentFinal.current_state).toBe("FAILED");
+
+    const delegateEvidence = parentFinal.evidence.DELEGATE as Record<
+      string,
+      unknown
+    >;
+    expect(delegateEvidence.child_result).toBe("failure");
+  });
+
+  it("child evidence keys include child_workflow_type", async () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "orch-sub-"));
+    writeWorkflow(
+      path.join(cwd, "src", "workflows"),
+      "child-wf",
+      childWorkflowTs,
+    );
+    writeWorkflow(
+      path.join(cwd, "src", "workflows"),
+      "parent-wf",
+      parentWorkflowTs,
+    );
+
+    const { pi } = createFakePi();
+    const store = new StateStore(path.join(cwd, ".orchestra"));
+    store.ensure();
+    const engine = new WorkflowEngine(pi, cwd, store);
+    await engine.loadWorkflows();
+
+    const parent = engine.start("parent-wf", {});
+    await engine.submitEvidence(parent.workflow_id, {
+      state: "SETUP",
+      result: "pass",
+      evidence: { input: "data" },
+    });
+    await engine.dispatchCurrentState(parent.workflow_id);
+
+    const ps = engine.get(parent.workflow_id) as WorkflowRuntimeState;
+    const childId = ps.children?.DELEGATE as unknown as string;
+    await engine.submitEvidence(childId, {
+      state: "WORK",
+      result: "done",
+      evidence: { out: "ok" },
+    });
+    await engine.dispatchCurrentState(childId);
+
+    const parentDone = engine.get(parent.workflow_id) as WorkflowRuntimeState;
+    const ev = parentDone.evidence.DELEGATE as Record<string, unknown>;
+    expect(ev.child_workflow_type).toBe("child-wf");
+    expect(ev.child_workflow_id).toBeDefined();
+  });
 });
 
 describe("applyRoleOverrides", () => {
@@ -2292,6 +2832,38 @@ describe("applyRoleOverrides", () => {
     expect(result.persona).toBeUndefined();
   });
 
+  it("personaTags requires non-empty tags AND non-empty team", () => {
+    // Empty tags array → no resolution
+    const configEmptyTags: ProjectConfig = {
+      ...baseConfig,
+      team: [{ role: "a", persona: ".team/a.md", tags: ["tdd"] }],
+      roles: { ping: { personaTags: [] } },
+    };
+    const r1 = applyRoleOverrides(baseRole, "ping", configEmptyTags);
+    expect(r1.personaPool).toBeUndefined();
+
+    // Empty team → no resolution
+    const configEmptyTeam: ProjectConfig = {
+      ...baseConfig,
+      team: [],
+      roles: { ping: { personaTags: ["tdd"] } },
+    };
+    const r2 = applyRoleOverrides(baseRole, "ping", configEmptyTeam);
+    expect(r2.personaPool).toBeUndefined();
+  });
+
+  it("personaTags strips fixed persona when pool is resolved", () => {
+    const roleWithPersona = { ...baseRole, persona: ".team/existing.md" };
+    const config: ProjectConfig = {
+      ...baseConfig,
+      team: [{ role: "a", persona: ".team/a.md", tags: ["tdd"] }],
+      roles: { ping: { personaTags: ["tdd"] } },
+    };
+    const result = applyRoleOverrides(roleWithPersona, "ping", config);
+    expect(result.personaPool).toEqual([".team/a.md"]);
+    expect(result.persona).toBeUndefined();
+  });
+
   it("personaTags with no matching team members leaves pool unchanged", () => {
     const config: ProjectConfig = {
       ...baseConfig,
@@ -2303,6 +2875,67 @@ describe("applyRoleOverrides", () => {
     const result = applyRoleOverrides(baseRole, "ping", config);
     // No team members have "tdd" tag
     expect(result.personaPool).toBeUndefined();
+  });
+
+  it("override with only persona does not change agent or personaPool", () => {
+    const config: ProjectConfig = {
+      ...baseConfig,
+      roles: { ping: { persona: ".team/override.md" } },
+    };
+    const result = applyRoleOverrides(baseRole, "ping", config);
+    expect(result.agent).toBe("tdd-red"); // unchanged
+    expect(result.persona).toBe(".team/override.md"); // changed
+    expect(result.personaPool).toBeUndefined(); // not set
+    expect(result.personaFrom).toBeUndefined(); // not set
+  });
+
+  it("override with only personaFrom does not change agent or persona", () => {
+    const config: ProjectConfig = {
+      ...baseConfig,
+      roles: { ping: { personaFrom: "turn_persona" } },
+    };
+    const result = applyRoleOverrides(baseRole, "ping", config);
+    expect(result.agent).toBe("tdd-red");
+    expect(result.persona).toBeUndefined();
+    expect(result.personaFrom).toBe("turn_persona");
+  });
+
+  it("override with empty fields doesn't corrupt base role", () => {
+    const config: ProjectConfig = {
+      ...baseConfig,
+      roles: { ping: {} },
+    };
+    const result = applyRoleOverrides(baseRole, "ping", config);
+    expect(result.agent).toBe("tdd-red");
+    expect(result.tools).toEqual(["read", "bash"]);
+  });
+
+  it("personaTags in workflowRole prevents early return but doesn't resolve without config override", () => {
+    // Having personaTags on the role prevents early-return optimization
+    // but actual resolution needs the tags to come from config override
+    const roleWithTags = { ...baseRole, personaTags: ["tdd"] };
+    const config: ProjectConfig = {
+      ...baseConfig,
+      team: [{ role: "alice", persona: ".team/alice.md", tags: ["tdd"] }],
+    };
+    const result = applyRoleOverrides(roleWithTags, "ping", config);
+    // No config override with personaTags → pool not resolved
+    expect(result.personaPool).toBeUndefined();
+    // But it returns a copy, not the original
+    expect(result).not.toBe(roleWithTags);
+  });
+
+  it("team members without tags are not matched", () => {
+    const config: ProjectConfig = {
+      ...baseConfig,
+      team: [
+        { role: "alice", persona: ".team/alice.md" },
+        { role: "bob", persona: ".team/bob.md", tags: ["tdd"] },
+      ],
+      roles: { ping: { personaTags: ["tdd"] } },
+    };
+    const result = applyRoleOverrides(baseRole, "ping", config);
+    expect(result.personaPool).toEqual([".team/bob.md"]);
   });
 
   it("does not affect roles not mentioned in config", () => {
