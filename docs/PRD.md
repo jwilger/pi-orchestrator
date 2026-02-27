@@ -20,6 +20,9 @@ We need a pi extension that provides **deterministic, structurally-enforced
 multi-agent workflows** — replacing prompt-based coordination with a state
 machine that agents cannot deviate from.
 
+> Requirements workbench: `docs/requirements/` (current autonomy track:
+> `lights-out-autonomy-discovery.md`, `lights-out-autonomy-planning.md`)
+
 ### Evidence: What Goes Wrong (from 119MB of bread_log session logs)
 
 **21 context compactions in a single session.** Each one resets the
