@@ -20,16 +20,11 @@ jobs:
         uses: 1password/load-secrets-action@v4
         env:
           OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
-          GH_AUTOMATION_APP_PRIVATE_KEY: op://Github Secrets/GH_AUTOMATION_APP_PRIVATE_KEY/credential
+          GH_RELEASE_AUTOMATION_TOKEN: op://Github Secrets/GH_RELEASE_AUTOMATION_TOKEN/credential
 
-      - uses: actions/create-github-app-token@v2
-        id: app-token
-        with:
-          app-id: ${{ vars.GH_AUTOMATION_APP_ID }}
-          private-key: ${{ steps.load_secrets.outputs.GH_AUTOMATION_APP_PRIVATE_KEY }}
       - uses: googleapis/release-please-action@v4
         with:
-          token: ${{ steps.app-token.outputs.token }}
+          token: ${{ steps.load_secrets.outputs.GH_RELEASE_AUTOMATION_TOKEN }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
           target-branch: main
