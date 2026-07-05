@@ -24,6 +24,12 @@ jobs:
       - run: npm run typecheck
       - run: npm test
       - run: npm run test:mutate
+      - name: Load npm token
+        id: load_secrets
+        uses: 1password/load-secrets-action@v4
+        env:
+          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+          NPM_TOKEN: op://Github Secrets/NPM_TOKEN/credential
       - run: npm publish --provenance --access public
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ steps.load_secrets.outputs.NPM_TOKEN }}

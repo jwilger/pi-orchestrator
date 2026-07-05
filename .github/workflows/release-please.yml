@@ -15,11 +15,18 @@ jobs:
       contents: write
       pull-requests: write
     steps:
+      - name: Load release secrets
+        id: load_secrets
+        uses: 1password/load-secrets-action@v4
+        env:
+          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+          GH_AUTOMATION_APP_PRIVATE_KEY: op://Github Secrets/GH_AUTOMATION_APP_PRIVATE_KEY/credential
+
       - uses: actions/create-github-app-token@v2
         id: app-token
         with:
           app-id: ${{ vars.GH_AUTOMATION_APP_ID }}
-          private-key: ${{ secrets.GH_AUTOMATION_APP_PRIVATE_KEY }}
+          private-key: ${{ steps.load_secrets.outputs.GH_AUTOMATION_APP_PRIVATE_KEY }}
       - uses: googleapis/release-please-action@v4
         with:
           token: ${{ steps.app-token.outputs.token }}
